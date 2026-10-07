@@ -399,7 +399,7 @@ func main() {
 		projectState := core.NewProjectStateStore(projectStatePath(cfg.DataDir, proj.Name))
 		effectiveWorkDir := applyProjectStateOverride(proj.Name, agent, workDir, projectState)
 		startInitialRefreshIfReady(agent, providerWiring)
-		sessionFile := sessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir)
+		sessionFile := projectSessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir, proj.SessionStorePath)
 
 		// Parse language setting
 		var lang core.Language
@@ -431,6 +431,7 @@ func main() {
 		engine.SetReplyFooterEnabled(showFooter)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
+		engine.SetSuppressUnsolicitedChannels(proj.SuppressUnsolicitedChannels)
 		engine.SetBaseWorkDir(workDir)
 		engine.SetProjectStateStore(projectState)
 		engine.SetDataDir(cfg.DataDir)
@@ -1472,6 +1473,27 @@ func sessionStorePath(dataDir, name, workDir string) string {
 	return filepath.Join(dataDir, "sessions", filename)
 }
 
+// projectSessionStorePath honors an explicit per-project session store while
+// preserving the legacy work_dir-derived behavior for projects that do not
+// configure one. Keeping the explicit store independent of work_dir prevents
+// /dir and restored project-state overrides from silently changing chat-to-
+// agent session bindings across restarts.
+func projectSessionStorePath(dataDir, name, workDir, configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return sessionStorePath(dataDir, name, workDir)
+	}
+	if strings.HasPrefix(configured, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			configured = filepath.Join(home, configured[2:])
+		}
+	}
+	if !filepath.IsAbs(configured) {
+		configured = filepath.Join(dataDir, configured)
+	}
+	return filepath.Clean(configured)
+}
+
 func projectStatePath(dataDir, projectName string) string {
 	replacer := strings.NewReplacer(
 		"\\", "_",
@@ -1823,6 +1845,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload filter_external_sessions
 	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
+	engine.SetSuppressUnsolicitedChannels(proj.SuppressUnsolicitedChannels)
 
 	// Reload providers
 	if ps, ok := engine.GetAgent().(core.ProviderSwitcher); ok {

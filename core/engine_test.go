@@ -138,6 +138,23 @@ func (a *resultAgent) StartSession(_ context.Context, _ string) (AgentSession, e
 func (a *resultAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
 func (a *resultAgent) Stop() error                                                { return nil }
 
+type blockingStartAgent struct {
+	session AgentSession
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingStartAgent) Name() string { return "stub" }
+func (a *blockingStartAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	close(a.started)
+	<-a.release
+	return a.session, nil
+}
+func (a *blockingStartAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *blockingStartAgent) Stop() error { return nil }
+
 type sessionEnvRecordingAgent struct {
 	stubAgent
 	session AgentSession
@@ -197,6 +214,25 @@ func (s *resultAgentSession) Events() <-chan Event                              
 func (s *resultAgentSession) CurrentSessionID() string                             { return "result-session" }
 func (s *resultAgentSession) Alive() bool                                          { return true }
 func (s *resultAgentSession) Close() error                                         { return nil }
+
+type errorEventAgentSession struct {
+	events chan Event
+	err    error
+}
+
+func newErrorEventAgentSession(err error) *errorEventAgentSession {
+	return &errorEventAgentSession{events: make(chan Event, 1), err: err}
+}
+
+func (s *errorEventAgentSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.events <- Event{Type: EventError, Error: s.err, Done: true}
+	return nil
+}
+func (s *errorEventAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *errorEventAgentSession) Events() <-chan Event                                 { return s.events }
+func (s *errorEventAgentSession) CurrentSessionID() string                             { return "error-session" }
+func (s *errorEventAgentSession) Alive() bool                                          { return true }
+func (s *errorEventAgentSession) Close() error                                         { return nil }
 
 type stubLifecyclePlatform struct {
 	stubPlatformEngine
@@ -380,6 +416,11 @@ func (p *stubCompactProgressPlatform) UpdateMessage(_ context.Context, _ any, co
 	p.previewEdits = append(p.previewEdits, content)
 	p.previewMu.Unlock()
 	return nil
+}
+
+func (p *stubCompactProgressPlatform) MessageIDFromHandle(handle any) (string, bool) {
+	id, ok := handle.(string)
+	return id, ok && id != ""
 }
 
 func (p *stubCompactProgressPlatform) BuildRichCard(status CardStatus, title string, steps []ToolStep, markdown string, streaming bool, statusFooter string) string {
@@ -1904,6 +1945,90 @@ func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported
 	}
 }
 
+func TestProcessInteractiveEvents_CardProgressEmbedsTerminalAnswerBeforeCompleting(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
+	sessionKey := "feishu:user-card-final-answer"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-card-final-answer")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card-final-answer",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventThinking, Content: "正在检查状态"}
+	agentSession.events <- Event{Type: EventResult, Content: "检查完成：任务运行正常。", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-card-final-answer", time.Now(), nil, nil, state.replyCtx)
+
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 {
+		t.Fatalf("preview starts = %d, want 1", len(starts))
+	}
+	edits := p.getPreviewEdits()
+	if len(edits) != 1 {
+		t.Fatalf("preview edits = %d, want one atomic final card update", len(edits))
+	}
+	finalPayload, ok := ParseProgressCardPayload(edits[0])
+	if !ok {
+		t.Fatalf("final preview should parse as structured payload, got %q", edits[0])
+	}
+	if finalPayload.State != ProgressCardStateCompleted {
+		t.Fatalf("final payload state = %q, want %q", finalPayload.State, ProgressCardStateCompleted)
+	}
+	if finalPayload.FinalAnswer != "检查完成：任务运行正常。" {
+		t.Fatalf("final answer = %q, want terminal answer in original card", finalPayload.FinalAnswer)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("separate final messages = %#v, want answer only in original progress card", sent)
+	}
+}
+
+func TestProcessInteractiveEvents_CardDirectFinalCreatesCompletedResultCard(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
+	sessionKey := "feishu:user-card-direct-final"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-card-direct-final")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card-direct-final",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "直接完成。", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-card-direct-final", time.Now(), nil, nil, state.replyCtx)
+
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 {
+		t.Fatalf("preview starts = %d, want one completed result card", len(starts))
+	}
+	payload, ok := ParseProgressCardPayload(starts[0])
+	if !ok {
+		t.Fatalf("result card should parse as structured payload, got %q", starts[0])
+	}
+	if payload.State != ProgressCardStateCompleted || payload.FinalAnswer != "直接完成。" {
+		t.Fatalf("payload = %#v, want completed card with direct final answer", payload)
+	}
+	if edits := p.getPreviewEdits(); len(edits) != 0 {
+		t.Fatalf("preview edits = %#v, want no edit after completed-card creation", edits)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("separate final messages = %#v, want only result card", sent)
+	}
+}
+
 // TestProcessInteractiveEvents_CardProgressTruncatesToolInputByToolMaxLen verifies
 // that when progress_style=card is used (e.g. Feishu), a long tool input is
 // truncated to display.ToolMaxLen in the structured card payload. The original
@@ -2084,6 +2209,11 @@ func (p *stubRichCardSilentPlatform) SendPreviewStart(_ context.Context, _ any, 
 	return fmt.Sprintf("handle-%d", p.nextHandleSeq), nil
 }
 
+func (p *stubRichCardSilentPlatform) MessageIDFromHandle(handle any) (string, bool) {
+	id, ok := handle.(string)
+	return id, ok && id != ""
+}
+
 func (p *stubRichCardSilentPlatform) UpdateMessage(_ context.Context, _ any, content string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2113,6 +2243,51 @@ func (p *stubRichCardSilentPlatform) snapshot() (starts, streams, updates []stri
 	updates = append(updates, p.updates...)
 	deletes = p.deleteCount
 	return
+}
+
+func TestProcessInteractiveEvents_RichCardHookTargetsResultMessage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix shell env capture is not available on Windows")
+	}
+	p := &stubRichCardSilentPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:             "full",
+		CardMode:         "rich",
+		ThinkingMessages: true,
+		ToolMessages:     true,
+	})
+	envFile := filepath.Join(t.TempDir(), "hook-env")
+	e.SetHooks(NewHookManager("test", []HookConfig{{
+		Event:   "message.sent",
+		Type:    "command",
+		Command: "env > " + envFile,
+		Async:   boolPtr(false),
+	}}, "sh", "-c", ""))
+
+	sessionKey := "feishu:user-rich-hook-message-id"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-rich-hook-message-id")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-rich-hook-message-id",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "final result"}
+	agentSession.events <- Event{Type: EventResult, Content: "final result", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-rich-hook-message-id", time.Now(), nil, nil, state.replyCtx)
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read hook env: %v", err)
+	}
+	if !strings.Contains(string(data), "CC_HOOK_MESSAGE_ID=handle-1\n") {
+		t.Fatalf("hook env does not target result card: %q", data)
+	}
 }
 
 type stubRichCardResolverPlatform struct {
@@ -7848,18 +8023,14 @@ func TestCmdStop_PreservesAgentSessionID(t *testing.T) {
 	}
 }
 
-// TestResumeFallback_ClearsStaleSessionID verifies that when agent.StartSession
-// fails with a stale session ID and falls back to a fresh session, the stale
-// AgentSessionID is cleared so CompareAndSetAgentSessionID can write the new ID
-// (issue #830, matching the relay fallback at engine.go:12640).
-func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
-	freshSess := newControllableSession("fresh-id")
+// A failed resume must not silently create a new conversation or overwrite the
+// saved binding. The user can explicitly use /new if a replacement is desired.
+func TestResumeFailurePreservesSavedSessionID(t *testing.T) {
+	var calls []string
 	agent := &controllableAgent{
 		startSessionFn: func(_ context.Context, sessionID string) (AgentSession, error) {
-			if sessionID != "" {
-				return nil, errors.New("session not found")
-			}
-			return freshSess, nil
+			calls = append(calls, sessionID)
+			return nil, errors.New("session not found")
 		},
 	}
 	p := &stubPlatformEngine{n: "test"}
@@ -7872,15 +8043,15 @@ func TestResumeFallback_ClearsStaleSessionID(t *testing.T) {
 
 	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "")
 
-	// The new agent session should be the fresh one.
-	if state.agentSession != freshSess {
-		t.Fatal("expected fresh agent session from fallback")
+	if state.agentSession != nil {
+		t.Fatal("resume failure unexpectedly created a fresh agent session")
 	}
-
-	// The stale ID should have been replaced with the new ID.
 	got := session.GetAgentSessionID()
-	if got != "fresh-id" {
-		t.Fatalf("AgentSessionID = %q, want %q — stale ID should be replaced", got, "fresh-id")
+	if got != "stale-id" {
+		t.Fatalf("AgentSessionID = %q, want saved ID preserved", got)
+	}
+	if len(calls) != 1 || calls[0] != "stale-id" {
+		t.Fatalf("StartSession calls = %#v, want only exact resume", calls)
 	}
 }
 
@@ -8366,7 +8537,7 @@ func (a *stubStartSessionAgent) ListSessions(_ context.Context) ([]AgentSessionI
 }
 func (a *stubStartSessionAgent) Stop() error { return nil }
 
-func TestResumeFailureFallbackToFreshSession(t *testing.T) {
+func TestResumeFailureDoesNotFallBackToFreshSession(t *testing.T) {
 	agent := &stubStartSessionAgent{
 		failIDs: map[string]error{
 			"old-session-id": fmt.Errorf("Prompt is too long"),
@@ -8391,22 +8562,22 @@ func TestResumeFailureFallbackToFreshSession(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "")
 
-	if state.agentSession == nil {
-		t.Fatal("expected agentSession to be non-nil after fallback")
+	if state.agentSession != nil {
+		t.Fatal("resume failure unexpectedly created a fresh agent session")
 	}
 
 	agent.mu.Lock()
 	calls := append([]string{}, agent.calls...)
 	agent.mu.Unlock()
 
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 StartSession calls, got %d: %v", len(calls), calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected one exact resume attempt, got %d: %v", len(calls), calls)
 	}
 	if calls[0] != "old-session-id" {
 		t.Fatalf("first StartSession call = %q, want saved session id", calls[0])
 	}
-	if calls[1] != "" {
-		t.Fatalf("second StartSession call = %q, want empty string", calls[1])
+	if got := session.GetAgentSessionID(); got != "old-session-id" {
+		t.Fatalf("AgentSessionID = %q, want saved ID preserved", got)
 	}
 }
 
@@ -8554,6 +8725,30 @@ type queuingAgentSession struct {
 	controllableAgentSession
 	sendCalls []string
 	sendMu    sync.Mutex
+}
+
+// steerableQueuingSession records native steering separately from normal
+// Send calls. Embedding keeps the controllable AgentSession behavior used by
+// the queue tests while opting this session into AgentSessionSteerer.
+type steerableQueuingSession struct {
+	*queuingAgentSession
+	steerCalls []string
+	steerErr   error
+	steerMu    sync.Mutex
+}
+
+func newSteerableQueuingSession(id string) *steerableQueuingSession {
+	return &steerableQueuingSession{queuingAgentSession: newQueuingSession(id)}
+}
+
+func (s *steerableQueuingSession) Steer(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.steerMu.Lock()
+	defer s.steerMu.Unlock()
+	if s.steerErr != nil {
+		return s.steerErr
+	}
+	s.steerCalls = append(s.steerCalls, prompt)
+	return nil
 }
 
 func newQueuingSession(id string) *queuingAgentSession {
@@ -10323,7 +10518,7 @@ func TestCmdPs_IdleSession_RepliesNoSession(t *testing.T) {
 
 func TestCmdPs_BusySession_InjectsToAgent(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
-	sess := newQueuingSession("ps-busy")
+	sess := newSteerableQueuingSession("ps-busy")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 
 	key := "test:user1"
@@ -10342,11 +10537,11 @@ func TestCmdPs_BusySession_InjectsToAgent(t *testing.T) {
 	msg := &Message{SessionKey: key, Content: "/ps add unit tests", ReplyCtx: "ctx"}
 	e.cmdPs(p, msg, []string{"add", "unit", "tests"})
 
-	sess.sendMu.Lock()
-	calls := append([]string(nil), sess.sendCalls...)
-	sess.sendMu.Unlock()
+	sess.steerMu.Lock()
+	calls := append([]string(nil), sess.steerCalls...)
+	sess.steerMu.Unlock()
 	if len(calls) != 1 || calls[0] != "add unit tests" {
-		t.Fatalf("expected Send(\"add unit tests\"), got %v", calls)
+		t.Fatalf("expected Steer(\"add unit tests\"), got %v", calls)
 	}
 
 	sent := p.getSent()
@@ -13572,6 +13767,28 @@ func TestExecuteCronJob_ResolvesCronReplyTarget(t *testing.T) {
 	}
 }
 
+func TestExecuteTimerJob_PropagatesAgentError(t *testing.T) {
+	platform := &stubCronReplyTargetPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+	}
+	upstreamErr := errors.New("anthropic: internal server error")
+	agentSession := newErrorEventAgentSession(upstreamErr)
+	e := NewEngine("test", &resultAgent{session: agentSession}, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+
+	job := &TimerJob{
+		ID:          "timer-upstream-error",
+		SessionKey:  "feishu:chat-1:user-1",
+		Prompt:      "check progress",
+		Description: "Progress check",
+	}
+
+	err := e.ExecuteTimerJob(job)
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("ExecuteTimerJob() error = %v, want wrapped upstream error", err)
+	}
+}
+
 func TestExecuteCronJob_WorkspacePrefixedSessionKey(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewCronStore(dir)
@@ -13853,6 +14070,52 @@ func TestHandleMessage_InstantReply_SendsConfirmationWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_InstantReply_PrecedesSlowAgentStart(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &blockingStartAgent{
+		session: newResultAgentSession("agent reply"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetInstantReply(InstantReplyCfg{Enabled: true, Content: "accepted"})
+
+	msg := &Message{
+		SessionKey: "test:slow-start",
+		Platform:   "test",
+		UserID:     "u1",
+		UserName:   "user",
+		Content:    "hello",
+		ReplyCtx:   "ctx",
+	}
+	e.handleMessage(p, msg)
+
+	select {
+	case <-agent.started:
+	case <-time.After(time.Second):
+		t.Fatal("agent start was not attempted")
+	}
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != "accepted" {
+		t.Fatalf("messages while StartSession is blocked = %#v, want immediate acknowledgement", sent)
+	}
+
+	close(agent.release)
+	deadline := time.After(2 * time.Second)
+	for len(p.getSent()) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for agent reply, got: %#v", p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if got := p.getSent(); len(got) != 2 {
+		t.Fatalf("messages after agent reply = %#v, want one acknowledgement and one result", got)
+	}
+}
+
 func TestHandleMessage_InstantReply_UsesDefaultI18nWhenContentEmpty(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	agentSession := newResultAgentSession("agent reply")
@@ -14046,6 +14309,202 @@ func waitForPlatformSend(p *stubPlatformEngine, n int, timeout time.Duration) []
 	}
 }
 
+type blockingUnsolicitedPreviewPlatform struct {
+	stubPlatformEngine
+	startEntered chan struct{}
+	releaseStart chan struct{}
+	startOnce    sync.Once
+
+	updateMu sync.Mutex
+	updates  []string
+}
+
+func (p *blockingUnsolicitedPreviewPlatform) SendPreviewStart(ctx context.Context, _ any, _ string) (any, error) {
+	p.startOnce.Do(func() { close(p.startEntered) })
+	select {
+	case <-p.releaseStart:
+		return "preview-1", nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *blockingUnsolicitedPreviewPlatform) UpdateMessage(_ context.Context, _ any, content string) error {
+	p.updateMu.Lock()
+	p.updates = append(p.updates, content)
+	p.updateMu.Unlock()
+	return nil
+}
+
+func (p *blockingUnsolicitedPreviewPlatform) getUpdates() []string {
+	p.updateMu.Lock()
+	defer p.updateMu.Unlock()
+	return append([]string(nil), p.updates...)
+}
+
+// TestUnsolicitedReader_StreamsWithoutPlatformBackpressure is the VM-to-phone
+// live-sync regression test. A blocked Feishu preview request must not stop the
+// reader from draining and persisting the terminal model event.
+func TestUnsolicitedReader_StreamsWithoutPlatformBackpressure(t *testing.T) {
+	p := &blockingUnsolicitedPreviewPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		startEntered:       make(chan struct{}),
+		releaseStart:       make(chan struct{}),
+	}
+	sess := newControllableSession("unsol-live-sync")
+	sess.events = make(chan Event, 32)
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true})
+	e.SetStreamPreviewCfg(StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    1,
+		MinDeltaChars: 1,
+		MaxChars:      2000,
+	})
+	defer e.Stop()
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:live:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, sessions, "test:live:u1", "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventThinking, Content: "checking the trace"}
+	select {
+	case <-p.startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("preview start was not attempted")
+	}
+
+	// Keep SendPreviewStart blocked while the authoritative result arrives.
+	// The reader should still drain and persist the complete turn immediately.
+	sess.events <- Event{Type: EventResult, Content: "authoritative answer", Done: true}
+
+	deadline := time.Now().Add(time.Second)
+	for session.HistoryLen() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if session.HistoryLen() != 1 {
+		t.Fatal("slow preview API blocked unsolicited event processing")
+	}
+	history := session.GetHistory(0)
+	if history[0].Role != "assistant" || history[0].Content != "authoritative answer" {
+		t.Fatalf("mirrored assistant history = %#v", history[0])
+	}
+
+	close(p.releaseStart)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		updates := p.getUpdates()
+		if len(updates) > 0 {
+			want := "💭 checking the trace\n\n---\n\nauthoritative answer"
+			if updates[len(updates)-1] != want {
+				t.Fatalf("final preview = %q, want %q", updates[len(updates)-1], want)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("final preview update was not delivered")
+}
+
+type restartRecoveryPlatform struct {
+	stubPlatformEngine
+	reconstructed []string
+}
+
+func (p *restartRecoveryPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	p.mu.Lock()
+	p.reconstructed = append(p.reconstructed, sessionKey)
+	p.mu.Unlock()
+	return "recovered:" + sessionKey, nil
+}
+
+type restartRecoverySession struct {
+	id       string
+	events   chan Event
+	recovery []RecoveredAgentTurn
+	cursor   string
+}
+
+func (s *restartRecoverySession) Send(string, string, []ImageAttachment, []FileAttachment) error {
+	return nil
+}
+func (s *restartRecoverySession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *restartRecoverySession) Events() <-chan Event                             { return s.events }
+func (s *restartRecoverySession) CurrentSessionID() string                         { return s.id }
+func (s *restartRecoverySession) Alive() bool                                      { return true }
+func (s *restartRecoverySession) Close() error                                     { return nil }
+func (s *restartRecoverySession) RecoverMissedTurns(context.Context, string, []HistoryEntry) ([]RecoveredAgentTurn, string, error) {
+	return append([]RecoveredAgentTurn(nil), s.recovery...), s.cursor, nil
+}
+
+type restartRecoveryAgent struct {
+	mu      sync.Mutex
+	calls   []string
+	session AgentSession
+}
+
+func (a *restartRecoveryAgent) Name() string { return "restart-recovery" }
+func (a *restartRecoveryAgent) StartSession(_ context.Context, id string) (AgentSession, error) {
+	a.mu.Lock()
+	a.calls = append(a.calls, id)
+	a.mu.Unlock()
+	return a.session, nil
+}
+func (a *restartRecoveryAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *restartRecoveryAgent) Stop() error                    { return nil }
+func (a *restartRecoveryAgent) RestoreSessionsOnStartup() bool { return true }
+
+func TestPlatformReadyRestoresSavedThreadAndReplaysMissedTurn(t *testing.T) {
+	p := &restartRecoveryPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	agentSession := &restartRecoverySession{
+		id:     "saved-thread",
+		events: make(chan Event, 8),
+		recovery: []RecoveredAgentTurn{{
+			ID:               "missed-turn",
+			UserMessage:      "from vm",
+			AssistantMessage: "missed answer",
+		}},
+		cursor: "missed-turn",
+	}
+	agent := &restartRecoveryAgent{session: agentSession}
+	e := NewEngine("restore-test", agent, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	key := "feishu:chat:user"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("saved-thread", agent.Name())
+	session.AddHistory("assistant", "previous answer")
+
+	e.onPlatformReady(p)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		agent.mu.Lock()
+		calls := append([]string(nil), agent.calls...)
+		agent.mu.Unlock()
+		if len(calls) == 1 && session.GetLastMirroredAgentTurnID() == "missed-turn" && len(p.getSent()) == 1 {
+			if calls[0] != "saved-thread" {
+				t.Fatalf("StartSession resumed %q, want saved-thread", calls[0])
+			}
+			sent := p.getSent()[0]
+			if !strings.Contains(sent, "from vm") || !strings.Contains(sent, "missed answer") {
+				t.Fatalf("replayed message = %q", sent)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("platform ready did not restore the durable Codex subscription")
+}
+
 // TestUnsolicitedReader_RelaysEventResult verifies that the unsolicited reader
 // goroutine relays EventResult content to the platform.
 func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
@@ -14096,6 +14555,180 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	if resync {
 		t.Error("expected eventsNeedResync=false after clean unsolicited EventResult")
 	}
+}
+
+// TestUnsolicitedReader_SuppressedChannelDrainsWithoutSending covers durable
+// Goal chats that use one separate status card. Internal Goal turns must still
+// be consumed and persisted so the event channel never backs up, but they must
+// not create one new platform card per turn.
+func TestUnsolicitedReader_SuppressedChannelDrainsWithoutSending(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	sess := newControllableSession("goal-thread")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetSuppressUnsolicitedChannels([]string{"cake-chat"})
+	defer e.Stop()
+
+	const sessionKey = "feishu:cake-chat:u1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, e.sessions, sessionKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventThinking, Content: "polling evaluator"}
+	sess.events <- Event{Type: EventText, Content: "checkpoint"}
+	sess.events <- Event{Type: EventResult, Content: "internal turn one", Done: true}
+	sess.events <- Event{Type: EventResult, Content: "internal turn two", Done: true}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for session.HistoryLen() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if session.HistoryLen() != 2 {
+		t.Fatalf("suppressed reader persisted %d turns, want 2", session.HistoryLen())
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("suppressed background turns created platform messages: %v", sent)
+	}
+	state.mu.Lock()
+	resync := state.eventsNeedResync
+	state.mu.Unlock()
+	if resync {
+		t.Fatal("clean suppressed turns unexpectedly require event resync")
+	}
+}
+
+// TestUnsolicitedReader_RelaysThinkingBeforeResult verifies that progress from
+// a VM-originated Codex turn is visible on the platform while the turn is still
+// running. Long goal turns may emit commentary for hours before EventResult;
+// dropping EventThinking makes an otherwise healthy VM session look stalled.
+func TestUnsolicitedReader_RelaysThinkingBeforeResult(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-thinking")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true})
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch-thinking:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	iKey := "test:ch-thinking:u1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, iKey, "/tmp/workspace")
+	defer e.stopUnsolicitedReader(state)
+
+	const progress = "8K/C64 completed; starting 16K/C1"
+	sess.events <- Event{Type: EventThinking, Content: progress}
+
+	sent := waitForPlatformSend(p, 1, 5*time.Second)
+	if len(sent) == 0 {
+		t.Fatal("expected unsolicited commentary before EventResult, got nothing")
+	}
+	if !strings.Contains(sent[0], progress) {
+		t.Fatalf("relayed commentary = %q, want it to contain %q", sent[0], progress)
+	}
+
+	// No terminal event has been emitted: this assertion is what distinguishes
+	// live progress relay from the pre-fix final-only behavior.
+	state.mu.Lock()
+	resync := state.eventsNeedResync
+	state.mu.Unlock()
+	if resync {
+		t.Fatal("live commentary unexpectedly marked the event stream for resync")
+	}
+}
+
+func TestUnsolicitedReader_CardStyleKeepsVMProgressInOneCard(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	sess := newControllableSession("unsol-card")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true})
+	e.SetStreamPreviewCfg(StreamPreviewCfg{Enabled: true, IntervalMs: 1, MinDeltaChars: 1, MaxChars: 2000})
+	defer e.Stop()
+
+	sessionKey := "feishu:maas:u1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.startUnsolicitedReader(state, session, e.sessions, sessionKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventThinking, Content: "62K/C64 is still running"}
+	deadline := time.Now().Add(2 * time.Second)
+	var running *ProgressCardPayload
+	for time.Now().Before(deadline) {
+		starts := p.getPreviewStarts()
+		if len(starts) > 0 {
+			running, _ = ParseProgressCardPayload(starts[0])
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if running == nil {
+		t.Fatal("VM progress did not start a structured Feishu card")
+	}
+	if running.State != ProgressCardStateRunning || len(running.Items) != 1 || !strings.Contains(running.Items[0].Text, "62K/C64") {
+		t.Fatalf("running card payload = %#v", running)
+	}
+
+	// A hours-long VM turn outgrows the 2000-character live preview. Subsequent
+	// updates must remain visible in the same card before EventResult arrives.
+	sess.events <- Event{Type: EventThinking, Content: strings.Repeat("earlier progress\n", 200)}
+	const latestProgress = "LATEST: new context branch has started its benchmark"
+	sess.events <- Event{Type: EventThinking, Content: latestProgress}
+	deadline = time.Now().Add(2 * time.Second)
+	latestVisible := false
+	for time.Now().Before(deadline) {
+		for _, edit := range p.getPreviewEdits() {
+			payload, ok := ParseProgressCardPayload(edit)
+			if ok && payload.State == ProgressCardStateRunning && len(payload.Items) == 1 && strings.Contains(payload.Items[0].Text, latestProgress) {
+				latestVisible = true
+				break
+			}
+		}
+		if latestVisible {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !latestVisible || len(p.getPreviewStarts()) != 1 {
+		t.Fatal("long-running VM progress stopped updating its original card")
+	}
+
+	sess.events <- Event{Type: EventResult, Content: "baseline arm complete", Done: true}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, edit := range p.getPreviewEdits() {
+			completed, ok := ParseProgressCardPayload(edit)
+			if ok && completed.State == ProgressCardStateCompleted {
+				if !strings.Contains(completed.FinalAnswer, "baseline arm complete") {
+					t.Fatalf("completed card final answer = %q", completed.FinalAnswer)
+				}
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("VM result did not complete the existing structured card")
 }
 
 // TestUnsolicitedReader_ResetsIdleCloseOnEventResult verifies the P1-C P1-1
@@ -14266,9 +14899,10 @@ func TestUnsolicitedReader_SetsResyncOnChannelClose(t *testing.T) {
 	}
 }
 
-// TestUnsolicitedReader_SetsResyncOnEventError verifies that EventError
-// sets eventsNeedResync to true and relays the error.
-func TestUnsolicitedReader_SetsResyncOnEventError(t *testing.T) {
+// TestUnsolicitedReader_LiveEventErrorKeepsMirroring verifies that a failed or
+// interrupted turn does not permanently detach VM-to-platform mirroring while
+// the underlying agent session remains alive.
+func TestUnsolicitedReader_LiveEventErrorKeepsMirroring(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	sess := newControllableSession("unsol-error")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -14295,22 +14929,79 @@ func TestUnsolicitedReader_SetsResyncOnEventError(t *testing.T) {
 
 	select {
 	case <-doneCh:
+		t.Fatal("live EventError stopped the unsolicited reader")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The next VM-originated turn must still be relayed by the same reader.
+	sess.events <- Event{Type: EventThinking, Content: "next turn is running"}
+	sess.events <- Event{Type: EventResult, Content: "next turn completed", Done: true}
+
+	sent := waitForPlatformSend(p, 2, 5*time.Second)
+	foundError := false
+	foundNextTurn := false
+	for _, message := range sent {
+		foundError = foundError || strings.Contains(message, "something broke")
+		foundNextTurn = foundNextTurn || strings.Contains(message, "next turn completed")
+	}
+	if !foundError {
+		t.Errorf("expected error to be relayed to platform, got %v", sent)
+	}
+	if !foundNextTurn {
+		t.Errorf("expected the next turn to remain mirrored, got %v", sent)
+	}
+
+	state.mu.Lock()
+	resync := state.eventsNeedResync
+	state.mu.Unlock()
+	if resync {
+		t.Error("live EventError unexpectedly marked the stream for resync")
+	}
+
+	e.stopUnsolicitedReader(state)
+}
+
+// TestUnsolicitedReader_DeadEventErrorSetsResync preserves the recovery path
+// for an EventError emitted while the underlying process is actually dead.
+func TestUnsolicitedReader_DeadEventErrorSetsResync(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-dead-error")
+	sess.alive = false
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	session := e.sessions.GetOrCreateActive("test:dead-error:u1")
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	e.startUnsolicitedReader(state, session, e.sessions, "test:dead-error:u1", "")
+
+	state.mu.Lock()
+	doneCh := state.unsolicitedDone
+	state.mu.Unlock()
+	sess.events <- Event{Type: EventError, Error: errors.New("process died")}
+
+	select {
+	case <-doneCh:
 	case <-time.After(5 * time.Second):
-		t.Fatal("unsolicited reader did not exit after EventError")
+		t.Fatal("dead EventError did not stop the unsolicited reader")
 	}
 
 	state.mu.Lock()
 	resync := state.eventsNeedResync
 	state.mu.Unlock()
 	if !resync {
-		t.Error("expected eventsNeedResync=true after EventError")
+		t.Error("expected eventsNeedResync=true for a dead agent session")
 	}
 
 	// Verify error was relayed to platform.
 	sent := p.getSent()
 	found := false
 	for _, s := range sent {
-		if strings.Contains(s, "something broke") {
+		if strings.Contains(s, "process died") {
 			found = true
 			break
 		}

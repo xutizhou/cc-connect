@@ -2,12 +2,111 @@ package pi
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"io"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
 )
+
+type testWriteCloser struct {
+	bytes.Buffer
+}
+
+func (w *testWriteCloser) Close() error { return nil }
+
+var _ io.WriteCloser = (*testWriteCloser)(nil)
+
+func TestPiSession_SteerUsesRPCSteeringCommand(t *testing.T) {
+	stdin := &testWriteCloser{}
+	s := &piSession{
+		rpc:       true,
+		rpcStdin:  stdin,
+		attachDir: t.TempDir(),
+	}
+	s.alive.Store(true)
+
+	if err := s.Steer("change direction", "msg-2", nil, nil); err != nil {
+		t.Fatalf("Steer() error = %v", err)
+	}
+	var cmd map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(stdin.Bytes()), &cmd); err != nil {
+		t.Fatalf("decode command: %v; raw=%q", err, stdin.String())
+	}
+	if cmd["type"] != "steer" || cmd["message"] != "change direction" {
+		t.Fatalf("steering command = %#v", cmd)
+	}
+}
+
+func TestPiSession_SteerRequiresRPCMode(t *testing.T) {
+	s := &piSession{}
+	s.alive.Store(true)
+	if err := s.Steer("change direction", "msg-2", nil, nil); err == nil || !strings.Contains(err.Error(), "requires rpc mode") {
+		t.Fatalf("Steer() error = %v, want rpc mode error", err)
+	}
+}
+
+var _ core.AgentSessionSteerer = (*piSession)(nil)
+var _ core.AgentSessionCanceller = (*piSession)(nil)
+
+func TestPiSession_ReadLoopRPCUnexpectedEOFEmitsTerminalError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &piSession{
+		ctx:      ctx,
+		cancel:   cancel,
+		events:   make(chan core.Event, 1),
+		rpcReady: make(chan struct{}),
+	}
+	s.alive.Store(true)
+	s.wg.Add(1)
+
+	s.readLoopRPC(io.NopCloser(strings.NewReader("")))
+
+	if s.Alive() {
+		t.Fatal("Alive() = true after RPC stdout EOF, want false")
+	}
+	select {
+	case event := <-s.events:
+		if event.Type != core.EventError {
+			t.Fatalf("event type = %v, want EventError", event.Type)
+		}
+		if event.Error == nil || !strings.Contains(event.Error.Error(), "rpc process exited unexpectedly") {
+			t.Fatalf("event error = %v, want unexpected RPC exit", event.Error)
+		}
+	default:
+		t.Fatal("unexpected RPC stdout EOF emitted no terminal event")
+	}
+}
+
+func TestPiSession_ReadLoopRPCExpectedCloseDoesNotEmitError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := &piSession{
+		ctx:      ctx,
+		cancel:   cancel,
+		events:   make(chan core.Event, 1),
+		rpcReady: make(chan struct{}),
+	}
+	s.alive.Store(true)
+	s.wg.Add(1)
+
+	s.readLoopRPC(io.NopCloser(strings.NewReader("")))
+
+	if s.Alive() {
+		t.Fatal("Alive() = true after expected RPC close, want false")
+	}
+	select {
+	case event := <-s.events:
+		t.Fatalf("expected close emitted event: %#v", event)
+	default:
+	}
+}
 
 // ── buildJSONArgs (Issue #1723) ────────────────────────────────
 //

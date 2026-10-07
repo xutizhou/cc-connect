@@ -56,13 +56,15 @@ type ProgressCardEntry struct {
 // ProgressCardPayload carries structured progress entries for platforms that
 // render custom progress cards.
 type ProgressCardPayload struct {
-	Version   int                 `json:"version,omitempty"`
-	Agent     string              `json:"agent,omitempty"`
-	Lang      string              `json:"lang,omitempty"`
-	State     ProgressCardState   `json:"state,omitempty"`
-	Entries   []string            `json:"entries,omitempty"` // legacy fallback
-	Items     []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
-	Truncated bool                `json:"truncated"`
+	Version      int                 `json:"version,omitempty"`
+	Agent        string              `json:"agent,omitempty"`
+	Lang         string              `json:"lang,omitempty"`
+	State        ProgressCardState   `json:"state,omitempty"`
+	Entries      []string            `json:"entries,omitempty"` // legacy fallback
+	Items        []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
+	FinalAnswer  string              `json:"final_answer,omitempty"`
+	StatusFooter string              `json:"status_footer,omitempty"`
+	Truncated    bool                `json:"truncated"`
 }
 
 // BuildProgressCardPayload encodes progress entries into a transport string.
@@ -91,6 +93,10 @@ func BuildProgressCardPayload(entries []string, truncated bool) string {
 
 // BuildProgressCardPayloadV2 encodes ordered typed progress events.
 func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState) string {
+	return buildProgressCardPayloadV2(items, truncated, agent, lang, state, "", "")
+}
+
+func buildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, finalAnswer, statusFooter string) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -110,19 +116,23 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 			Success:  item.Success,
 		})
 	}
-	if len(cleaned) == 0 {
+	finalAnswer = strings.TrimSpace(finalAnswer)
+	statusFooter = strings.TrimSpace(statusFooter)
+	if len(cleaned) == 0 && finalAnswer == "" {
 		return ""
 	}
 	if state == "" {
 		state = ProgressCardStateRunning
 	}
 	payload := ProgressCardPayload{
-		Version:   2,
-		Agent:     strings.TrimSpace(agent),
-		Lang:      string(lang),
-		State:     state,
-		Items:     cleaned,
-		Truncated: truncated,
+		Version:      2,
+		Agent:        strings.TrimSpace(agent),
+		Lang:         string(lang),
+		State:        state,
+		Items:        cleaned,
+		FinalAnswer:  finalAnswer,
+		StatusFooter: statusFooter,
+		Truncated:    truncated,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -169,7 +179,9 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 			})
 		}
 	}
-	if len(items) == 0 && len(legacy) == 0 {
+	payload.FinalAnswer = strings.TrimSpace(payload.FinalAnswer)
+	payload.StatusFooter = strings.TrimSpace(payload.StatusFooter)
+	if len(items) == 0 && len(legacy) == 0 && payload.FinalAnswer == "" {
 		return nil, false
 	}
 	if payload.State == "" {
@@ -218,15 +230,17 @@ type compactProgressWriter struct {
 	style      string
 	usePayload bool
 
-	content    string
-	entries    []string
-	items      []ProgressCardEntry
-	state      ProgressCardState
-	agentName  string
-	lang       Language
-	truncated  bool
-	lastSent   string
-	maxEntries int
+	content      string
+	entries      []string
+	items        []ProgressCardEntry
+	state        ProgressCardState
+	agentName    string
+	lang         Language
+	finalAnswer  string
+	statusFooter string
+	truncated    bool
+	lastSent     string
+	maxEntries   int
 
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
@@ -425,7 +439,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		}
 		w.truncated = truncated
 		if w.usePayload {
-			w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+			w.content = w.buildPayload()
 			if w.content == "" {
 				slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
 				w.failed = true
@@ -497,17 +511,84 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 // Finalize updates card progress state (running/completed/failed) without
 // appending a new progress entry.
 func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
+	return w.finalize(state)
+}
+
+// FinalizeWithAnswer atomically writes the final answer into the existing
+// progress card and flips that same card to its terminal state. Returning
+// false tells the engine to retain the normal separate-message fallback.
+func (w *compactProgressWriter) FinalizeWithAnswer(state ProgressCardState, answer, statusFooter string) bool {
+	if !w.canEmbedFinalAnswer() || strings.TrimSpace(answer) == "" {
+		return false
+	}
+	w.finalAnswer = answer
+	w.statusFooter = statusFooter
+	if w.handle == nil {
+		// Some short turns emit a terminal answer without any preceding thinking
+		// or tool event. Create their first (and only) card already completed so
+		// the result still has a stable message ID for post-delivery hooks such as
+		// Feishu urgent notification.
+		if state == "" {
+			state = ProgressCardStateCompleted
+		}
+		w.state = state
+		w.content = w.buildPayload()
+		if w.content == "" || w.starter == nil {
+			return false
+		}
+		callCtx, cancel := w.withAPITimeout()
+		handle, err := w.starter.SendPreviewStart(callCtx, w.replyCtx, w.content)
+		cancel()
+		if err != nil || handle == nil {
+			slog.Warn("progress writer: terminal SendPreviewStart failed", "platform", w.platform.Name(), "style", w.style, "error", err, "handle_nil", handle == nil)
+			w.failed = true
+			return false
+		}
+		w.handle = handle
+		w.lastSent = w.content
+		w.lastUpdateAt = time.Now()
+		return true
+	}
+	if w.finalize(state) {
+		return true
+	}
+
+	// A large answer may exceed a platform's editable-card limit even though
+	// the small progress-only card is valid. Make one best-effort attempt to
+	// close the progress card without the answer; the engine will then send the
+	// full response through its established separate-message fallback.
+	w.failed = false
+	w.finalAnswer = ""
+	w.statusFooter = ""
+	_ = w.finalize(state)
+	return false
+}
+
+func (w *compactProgressWriter) canEmbedFinalAnswer() bool {
+	return w.enabled && !w.failed && w.style == progressStyleCard && w.usePayload
+}
+
+func (w *compactProgressWriter) messageHandle() any {
+	return w.handle
+}
+
+func (w *compactProgressWriter) buildPayload() string {
+	answer := w.finalAnswer
+	if answer != "" && w.transform != nil {
+		answer = w.transform(answer)
+	}
+	return buildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state, answer, w.statusFooter)
+}
+
+func (w *compactProgressWriter) finalize(state ProgressCardState) bool {
 	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.handle == nil {
 		return false
 	}
 	if state == "" {
 		state = ProgressCardStateCompleted
 	}
-	if w.state == state {
-		return true
-	}
 	w.state = state
-	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+	w.content = w.buildPayload()
 	if w.content == "" || w.content == w.lastSent {
 		return w.content != ""
 	}

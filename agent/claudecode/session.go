@@ -31,6 +31,9 @@ type claudeSession struct {
 	cmd             *exec.Cmd
 	stdin           io.WriteCloser
 	stdinMu         sync.Mutex
+	steerMu         sync.Mutex
+	steerQueue      []any
+	steerInterrupt  bool
 	events          chan core.Event
 	sessionID       atomic.Value // stores string
 	permissionMode  atomic.Value // stores string
@@ -872,6 +875,16 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		cs.usageMu.Unlock()
 	}
 
+	// A steering request interrupts the old Claude query and then starts the
+	// replacement input on the same stream-json process. Claude emits a result
+	// for the interrupted query first. Consume that intermediate result and
+	// write the queued correction(s) before allowing the engine to observe a
+	// final EventResult; otherwise the engine would unlock the session and move
+	// the card to "done" before Claude processes the correction.
+	if !isCompaction && cs.continueAfterSteeringInterrupt() {
+		return
+	}
+
 	evt := core.Event{
 		Type:                     core.EventResult,
 		Content:                  content,
@@ -980,12 +993,12 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 	if !cs.alive.Load() {
 		return fmt.Errorf("session process is not running")
 	}
+	return cs.writeUserContent(cs.buildUserContent(prompt, messageID, images, files))
+}
 
+func (cs *claudeSession) buildUserContent(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) any {
 	if len(images) == 0 && len(files) == 0 {
-		return cs.writeJSON(map[string]any{
-			"type":    "user",
-			"message": map[string]any{"role": "user", "content": prompt},
-		})
+		return prompt
 	}
 
 	attachDir := filepath.Join(cs.workDir, ".cc-connect", "attachments")
@@ -1039,11 +1052,123 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 		textPart += "\n\n(Files saved locally, please read them: " + strings.Join(filePaths, ", ") + ")"
 	}
 	parts = append(parts, map[string]any{"type": "text", "text": textPart})
+	return parts
+}
 
+func (cs *claudeSession) writeUserContent(content any) error {
 	return cs.writeJSON(map[string]any{
 		"type":    "user",
-		"message": map[string]any{"role": "user", "content": parts},
+		"message": map[string]any{"role": "user", "content": content},
 	})
+}
+
+// Steer interrupts Claude Code's active streaming-input query, then delivers
+// the correction on the same long-lived process. Corrections arriving before
+// the interrupt result are merged into one replacement user message so one
+// interrupt always corresponds to exactly one intermediate result.
+func (cs *claudeSession) Steer(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("session process is not running")
+	}
+	content := cs.buildUserContent(prompt, messageID, images, files)
+
+	cs.steerMu.Lock()
+	defer cs.steerMu.Unlock()
+	cs.steerQueue = append(cs.steerQueue, content)
+	if cs.steerInterrupt {
+		return nil
+	}
+	cs.steerInterrupt = true
+	if err := cs.writeInterruptControlRequest(); err != nil {
+		cs.steerQueue = cs.steerQueue[:len(cs.steerQueue)-1]
+		cs.steerInterrupt = false
+		return err
+	}
+	return nil
+}
+
+// CancelTurn sends the control request used by the Claude Agent SDK's
+// interrupt() operation. The long-lived stream-json process remains reusable.
+func (cs *claudeSession) CancelTurn() error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("session process is not running")
+	}
+	cs.steerMu.Lock()
+	cs.steerQueue = nil
+	cs.steerInterrupt = false
+	err := cs.writeInterruptControlRequest()
+	cs.steerMu.Unlock()
+	return err
+}
+
+func (cs *claudeSession) writeInterruptControlRequest() error {
+	requestID := fmt.Sprintf("cc-connect-interrupt-%d", time.Now().UnixNano())
+	return cs.writeJSON(map[string]any{
+		"type":       "control_request",
+		"request_id": requestID,
+		"request": map[string]any{
+			"subtype": "interrupt",
+		},
+	})
+}
+
+// continueAfterSteeringInterrupt consumes Claude's result for the query that
+// Steer interrupted and starts the replacement input. It returns true when
+// the result is intermediate and must not be emitted to the engine.
+func (cs *claudeSession) continueAfterSteeringInterrupt() bool {
+	cs.steerMu.Lock()
+	defer cs.steerMu.Unlock()
+	if !cs.steerInterrupt || len(cs.steerQueue) == 0 {
+		return false
+	}
+
+	content := mergeClaudeUserContent(cs.steerQueue)
+	cs.steerQueue = nil
+	if err := cs.writeUserContent(content); err != nil {
+		cs.steerInterrupt = false
+		slog.Error("claudeSession: failed to deliver steering input after interrupt", "error", err)
+		cs.emitSteeringError(err)
+		return true
+	}
+	cs.steerInterrupt = false
+	slog.Info("claudeSession: interrupted query redirected with steering input")
+	return true
+}
+
+func mergeClaudeUserContent(inputs []any) any {
+	if len(inputs) == 1 {
+		return inputs[0]
+	}
+	parts := make([]map[string]any, 0, len(inputs)*2)
+	for i, input := range inputs {
+		if i > 0 {
+			parts = append(parts, map[string]any{"type": "text", "text": "\n\n[Additional user message]\n"})
+		}
+		switch content := input.(type) {
+		case string:
+			parts = append(parts, map[string]any{"type": "text", "text": content})
+		case []map[string]any:
+			parts = append(parts, content...)
+		default:
+			parts = append(parts, map[string]any{"type": "text", "text": fmt.Sprint(content)})
+		}
+	}
+	return parts
+}
+
+func (cs *claudeSession) emitSteeringError(err error) {
+	if cs.events == nil {
+		return
+	}
+	evt := core.Event{Type: core.EventError, Error: fmt.Errorf("claude steering: %w", err)}
+	var ctxDone <-chan struct{}
+	if cs.ctx != nil {
+		ctxDone = cs.ctx.Done()
+	}
+	select {
+	case cs.events <- evt:
+	case <-ctxDone:
+	}
 }
 
 // RespondPermission writes a control_response to the Claude process stdin.

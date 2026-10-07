@@ -14,7 +14,7 @@ type StreamPreviewCfg struct {
 	DisabledPlatforms []string // platforms where streaming preview is disabled (e.g. "feishu")
 	IntervalMs        int      // minimum ms between updates (default 1500)
 	MinDeltaChars     int      // minimum new chars before sending an update (default 30)
-	MaxChars          int      // max preview length (default 2000)
+	MaxChars          int      // latest characters retained in live preview (default 2000)
 }
 
 // DefaultStreamPreviewCfg returns sensible defaults.
@@ -156,6 +156,12 @@ func newStreamPreview(cfg StreamPreviewCfg, p Platform, replyCtx any, ctx contex
 	}
 }
 
+func (sp *streamPreview) setTransform(transform func(string) string) {
+	sp.mu.Lock()
+	sp.transform = transform
+	sp.mu.Unlock()
+}
+
 // canPreview returns true if the platform supports message updating and is not disabled.
 func (sp *streamPreview) canPreview() bool {
 	sp.mu.Lock()
@@ -186,11 +192,7 @@ func (sp *streamPreview) appendText(text string) {
 
 	sp.fullText += text
 
-	displayText := sp.fullText
-	maxChars := sp.cfg.MaxChars
-	if maxChars > 0 && len([]rune(displayText)) > maxChars {
-		displayText = string([]rune(displayText)[:maxChars]) + "…"
-	}
+	displayText := sp.liveTextLocked()
 
 	delta := len([]rune(displayText)) - len([]rune(sp.lastSentText))
 	elapsed := time.Since(sp.lastSentAt)
@@ -211,6 +213,20 @@ func (sp *streamPreview) appendText(text string) {
 	sp.flushLocked(displayText)
 }
 
+// liveTextLocked bounds the displayed window, not progress itself. Retaining
+// the prefix freezes long-running cards once MaxChars is reached because all
+// later frames compare equal in flushLocked. Keep the newest Unicode runes;
+// fullText and the authoritative final answer remain intact.
+func (sp *streamPreview) liveTextLocked() string {
+	if maxChars := sp.cfg.MaxChars; maxChars > 0 {
+		runes := []rune(sp.fullText)
+		if len(runes) > maxChars {
+			return "…" + string(runes[len(runes)-maxChars:])
+		}
+	}
+	return sp.fullText
+}
+
 func (sp *streamPreview) scheduleFlushLocked(delay time.Duration) {
 	if sp.timer != nil {
 		return // already scheduled
@@ -222,12 +238,7 @@ func (sp *streamPreview) scheduleFlushLocked(delay time.Duration) {
 		if sp.degraded {
 			return
 		}
-		displayText := sp.fullText
-		maxChars := sp.cfg.MaxChars
-		if maxChars > 0 && len([]rune(displayText)) > maxChars {
-			displayText = string([]rune(displayText)[:maxChars]) + "…"
-		}
-		sp.flushLocked(displayText)
+		sp.flushLocked(sp.liveTextLocked())
 	})
 }
 
@@ -303,11 +314,7 @@ func (sp *streamPreview) freeze() {
 
 	if sp.previewMsgID != nil && !sp.degraded {
 		if updater, ok := sp.platform.(MessageUpdater); ok {
-			text := sp.fullText
-			maxChars := sp.cfg.MaxChars
-			if maxChars > 0 && len([]rune(text)) > maxChars {
-				text = string([]rune(text)[:maxChars]) + "…"
-			}
+			text := sp.liveTextLocked()
 			if text != "" {
 				if sp.transform != nil {
 					text = sp.transform(text)

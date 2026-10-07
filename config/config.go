@@ -473,6 +473,10 @@ type ProjectConfig struct {
 	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
 	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
 	SkipGit *bool  `toml:"skip_git,omitempty"`
+	// SessionStorePath pins this project's cc-connect session database to a
+	// stable path. Relative paths are resolved beneath data_dir. When unset,
+	// the store name continues to be derived from the effective work_dir.
+	SessionStorePath string `toml:"session_store_path,omitempty"`
 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
@@ -548,6 +552,11 @@ type ProjectConfig struct {
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
 	// Default is false (show all sessions).
 	FilterExternalSessions *bool `toml:"filter_external_sessions,omitempty"`
+	// SuppressUnsolicitedChannels consumes and persists VM-originated/background
+	// turns for the listed platform channel IDs without creating one platform
+	// message per turn. A separate durable-goal status card can mirror these
+	// high-frequency turns and notify only at a real terminal state.
+	SuppressUnsolicitedChannels []string `toml:"suppress_unsolicited_channels,omitempty"`
 	// Shell overrides the global shell for this project. See Config.Shell.
 	Shell string `toml:"shell,omitempty"`
 	// ShellProfile overrides the global shell_profile for this project.

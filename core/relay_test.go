@@ -455,7 +455,7 @@ func (a *relayFallbackAgent) ListSessions(_ context.Context) ([]AgentSessionInfo
 }
 func (a *relayFallbackAgent) Stop() error { return nil }
 
-func TestHandleRelay_ResumeFailureFallsBackToFreshSession(t *testing.T) {
+func TestHandleRelay_ResumeFailurePreservesBinding(t *testing.T) {
 	e := newTestEngine()
 	freshSession := newControllableSession("fresh-session")
 
@@ -469,29 +469,15 @@ func TestHandleRelay_ResumeFailureFallsBackToFreshSession(t *testing.T) {
 	e.sessions.Save()
 
 	ctx := context.Background()
-	done := make(chan string, 1)
-	go func() {
-		resp, err := e.HandleRelay(ctx, "source", sourceSessionKey, "hello")
-		if err != nil {
-			done <- "error: " + err.Error()
-			return
-		}
-		done <- resp
-	}()
-
-	// The fresh session should receive the message and respond.
-	freshSession.events <- Event{Type: EventResult, Content: "recovered", SessionID: "fresh-session", Done: true}
-
-	got := <-done
-	if got != "recovered" {
-		t.Fatalf("HandleRelay() = %q, want %q", got, "recovered")
+	_, err := e.HandleRelay(ctx, "source", sourceSessionKey, "hello")
+	if err == nil || !strings.Contains(err.Error(), "simulated resume failure") {
+		t.Fatalf("HandleRelay() error = %v, want resume failure", err)
 	}
-
-	// Session should be closed after EventResult.
-	select {
-	case <-freshSession.closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("session was not closed after EventResult")
+	if got := sess.GetAgentSessionID(); got != "stale-id" {
+		t.Fatalf("AgentSessionID = %q, want saved ID preserved", got)
+	}
+	if calls := e.agent.(*relayFallbackAgent).callCount; calls != 1 {
+		t.Fatalf("StartSession calls = %d, want one exact resume attempt", calls)
 	}
 }
 

@@ -41,6 +41,16 @@ func TestNew_CanDisableInteractiveCards(t *testing.T) {
 	}
 }
 
+func TestMessageIDFromHandle(t *testing.T) {
+	p := &Platform{}
+	if got, ok := p.MessageIDFromHandle(&feishuPreviewHandle{messageID: "om_result"}); !ok || got != "om_result" {
+		t.Fatalf("MessageIDFromHandle() = %q, %v; want om_result, true", got, ok)
+	}
+	if got, ok := p.MessageIDFromHandle(struct{}{}); ok || got != "" {
+		t.Fatalf("MessageIDFromHandle(invalid) = %q, %v; want empty, false", got, ok)
+	}
+}
+
 func TestNew_DisabledInteractiveCardsDoesNotStartPreviewCard(t *testing.T) {
 	pAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": false})
 	if err != nil {
@@ -1046,6 +1056,30 @@ func TestBuildPreviewCardJSON_ProgressPayloadUsesStructuredCard(t *testing.T) {
 	header, ok := card["header"].(map[string]any)
 	if !ok || header == nil {
 		t.Fatalf("expected header in card json, got %#v", card["header"])
+	}
+}
+
+func TestBuildProgressCardJSON_CompletedCardShowsFinalAnswerInPlace(t *testing.T) {
+	payload := &core.ProgressCardPayload{
+		Version: 2,
+		Agent:   "Codex",
+		Lang:    string(core.LangChinese),
+		State:   core.ProgressCardStateCompleted,
+		Items: []core.ProgressCardEntry{
+			{Kind: core.ProgressEntryThinking, Text: "正在检查状态"},
+		},
+		FinalAnswer:  "检查完成：任务运行正常。",
+		StatusFooter: "耗时 12 秒",
+	}
+
+	cardJSON := buildProgressCardJSONFromPayload(payload)
+	for _, want := range []string{"Codex · 已完成", "检查完成：任务运行正常。", "耗时 12 秒"} {
+		if !strings.Contains(cardJSON, want) {
+			t.Fatalf("completed card should contain %q, got %q", want, cardJSON)
+		}
+	}
+	if strings.Contains(cardJSON, "完整答复见下一条消息") {
+		t.Fatalf("completed card with embedded answer must not point to another message: %q", cardJSON)
 	}
 }
 

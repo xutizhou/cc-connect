@@ -33,10 +33,20 @@ func forceKillCmd(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+
+	// Pi's bash tool deliberately starts commands in a new session. Those
+	// commands are descendants of the Pi process, but no longer members of
+	// Pi's process group, so a group-only kill leaves them running after an
+	// idle timeout or /stop. Discover and signal descendants while the Pi
+	// parent is still alive; once the parent exits detached descendants are
+	// re-parented and can no longer be associated with this session safely.
+	descendantErr := forceKillDescendants(cmd.Process.Pid)
+
+	var groupErr error
 	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
 		!errors.Is(err, os.ErrProcessDone) &&
 		!errors.Is(err, syscall.ESRCH) {
-		return err
+		groupErr = err
 	}
-	return nil
+	return errors.Join(descendantErr, groupErr)
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1712,6 +1713,18 @@ func TestLoad_ParsesResetOnIdleMins(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesSessionStorePath(t *testing.T) {
+	configPath := writeConfigFixture(t, projectWithSessionStorePathFixture)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.Projects[0].SessionStorePath; got != "sessions/vm-codex-shared.json" {
+		t.Fatalf("SessionStorePath = %q, want %q", got, "sessions/vm-codex-shared.json")
+	}
+}
+
 func TestLoad_RejectsNegativeResetOnIdleMins(t *testing.T) {
 	configPath := writeConfigFixture(t, projectWithNegativeResetOnIdleFixture)
 
@@ -1911,6 +1924,35 @@ token = "test"
 	proj := cfg.Projects[0]
 	if proj.FilterExternalSessions == nil || *proj.FilterExternalSessions {
 		t.Fatalf("FilterExternalSessions should be false, got %v", proj.FilterExternalSessions)
+	}
+}
+
+func TestLoad_SuppressUnsolicitedChannels(t *testing.T) {
+	fixture := `
+[[projects]]
+name = "goal-chat"
+suppress_unsolicited_channels = ["oc_cake", "oc_other"]
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "/tmp/goal-chat"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "test"
+`
+	configPath := writeConfigFixture(t, fixture)
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Projects[0].SuppressUnsolicitedChannels
+	if !reflect.DeepEqual(got, []string{"oc_cake", "oc_other"}) {
+		t.Fatalf("SuppressUnsolicitedChannels = %#v", got)
 	}
 }
 
@@ -2130,6 +2172,24 @@ allow_from = "ou_existing_owner"
 const projectWithoutFeishuFixture = `
 [[projects]]
 name = "beta"
+
+[projects.agent]
+type = "codex"
+
+[projects.agent.options]
+work_dir = "/tmp/beta"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+bot_token = "token_xxx"
+`
+
+const projectWithSessionStorePathFixture = `
+[[projects]]
+name = "beta"
+session_store_path = "sessions/vm-codex-shared.json"
 
 [projects.agent]
 type = "codex"

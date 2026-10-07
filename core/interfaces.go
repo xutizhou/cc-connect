@@ -205,6 +205,13 @@ type SessionIDValidator interface {
 	ValidateSessionID(ctx context.Context, sessionID string) bool
 }
 
+// AgentSessionLookup optionally resolves an explicitly supplied full session ID
+// outside the default ListSessions scope. Implementations must reject partial
+// IDs and must not mutate the agent's workspace or the target session.
+type AgentSessionLookup interface {
+	LookupSession(ctx context.Context, sessionID string) (*AgentSessionInfo, error)
+}
+
 // TypingIndicator is an optional interface for platforms that can show a
 // "processing" indicator (typing bubble, emoji reaction, etc.) while the
 // agent is working. StartTyping is called when processing begins and returns
@@ -241,6 +248,15 @@ type FileSender interface {
 // MessageUpdater is an optional interface for platforms that support updating messages.
 type MessageUpdater interface {
 	UpdateMessage(ctx context.Context, replyCtx any, content string) error
+}
+
+// MessageHandleIDProvider is an optional interface for platforms whose
+// editable-message handle contains a stable platform message ID. The engine
+// exposes that ID to lifecycle hooks so post-delivery actions (for example,
+// marking the delivered message urgent) can target the actual result message
+// instead of creating a detached notification.
+type MessageHandleIDProvider interface {
+	MessageIDFromHandle(handle any) (string, bool)
 }
 
 // StatusFooterSender is an optional Platform extension for sending a reply
@@ -374,6 +390,31 @@ type AgentSession interface {
 	Alive() bool
 	// Close terminates the session and its underlying process.
 	Close() error
+}
+
+// StartupSessionRestorer marks an agent transport whose durable sessions
+// should be re-subscribed when the messaging platform reconnects. This is
+// intentionally opt-in: spawning every ordinary CLI session at service startup
+// would be expensive and could change their lifecycle semantics.
+type StartupSessionRestorer interface {
+	RestoreSessionsOnStartup() bool
+}
+
+// RecoveredAgentTurn is a completed agent-side turn that was not observed by
+// this cc-connect process (typically because the process was restarting).
+type RecoveredAgentTurn struct {
+	ID               string
+	UserMessage      string
+	AssistantMessage string
+}
+
+// AgentSessionRecovery is implemented by persistent transports that can
+// reconcile completed turns after reconnecting. The returned cursor is the
+// newest completed turn accounted for, even when no message needs replaying.
+// Implementations must be conservative when they cannot locate the previous
+// cursor: duplicate platform delivery is worse than omitting an old replay.
+type AgentSessionRecovery interface {
+	RecoverMissedTurns(ctx context.Context, afterTurnID string, localHistory []HistoryEntry) (turns []RecoveredAgentTurn, cursor string, err error)
 }
 
 // PermissionResult represents the user's decision on a permission request.
@@ -529,6 +570,19 @@ type ContextCompressor interface {
 // /stop, allowing the session to remain alive for the next user message.
 type AgentSessionCanceller interface {
 	CancelTurn() error
+}
+
+// AgentSessionSteerer is an optional interface for agent sessions that can
+// inject additional user input into the turn currently in flight. Steer must
+// not create an additional engine-level turn-completion event: the existing
+// foreground event loop remains the sole owner of the active turn and waits
+// for its eventual EventResult.
+//
+// The engine uses this capability for ordinary messages received while a
+// session is busy. Agents that cannot safely steer should omit the interface;
+// the engine then falls back to its deferred FIFO queue.
+type AgentSessionSteerer interface {
+	Steer(prompt string, messageID string, images []ImageAttachment, files []FileAttachment) error
 }
 
 // CommandProvider is an optional interface for agents that expose custom slash

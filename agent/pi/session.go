@@ -285,33 +285,43 @@ func (s *piSession) readLoopRPC(stdout io.ReadCloser) {
 		}
 	}
 
+	// Mark the session dead before publishing the terminal event. The engine
+	// consults Alive() while handling EventError to decide whether queued work
+	// can still be processed, so publishing first leaves a race where it may
+	// incorrectly treat an exited RPC process as usable.
+	s.alive.Store(false)
+
 	// Process exited — reap the child and signal the engine.
 	// killRPC (now with Wait()) ensures the zombie is collected.
 	s.killRPC()
 
-	if err := scanner.Err(); err != nil {
-		slog.Error("piSession: scanner error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
-		select {
-		case s.events <- evt:
-		case <-s.ctx.Done():
-		}
+	// Close() cancels the context before terminating the process. That is an
+	// expected EOF and must not be surfaced as an agent failure.
+	if s.ctx.Err() != nil {
+		return
 	}
 
-	// Signal process death to the engine (unless Close() already did).
-	// Following the claudecode finishReadLoop pattern: always set alive=false,
-	// and emit EventError with the captured stderr when present.
-	// All writes to s.events happen before the deferred wg.Done(), so
-	// Close()'s wg.Wait() → close(s.events) is correctly ordered.
+	// Every unexpected RPC exit must produce a terminal event. Previously a
+	// clean stdout EOF with empty stderr produced no event and left the engine
+	// waiting until its (potentially hours-long) idle timeout.
+	scanErr := scanner.Err()
 	stderrMsg := strings.TrimSpace(s.stderrBuf.String())
-	if stderrMsg != "" {
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("pi: %s", stderrMsg)}
-		select {
-		case s.events <- evt:
-		case <-s.ctx.Done():
-		}
+	var exitErr error
+	switch {
+	case scanErr != nil && stderrMsg != "":
+		exitErr = fmt.Errorf("read stdout: %w; pi: %s", scanErr, stderrMsg)
+	case scanErr != nil:
+		exitErr = fmt.Errorf("read stdout: %w", scanErr)
+	case stderrMsg != "":
+		exitErr = fmt.Errorf("pi: %s", stderrMsg)
+	default:
+		exitErr = fmt.Errorf("pi rpc process exited unexpectedly")
 	}
-	s.alive.Store(false)
+	slog.Error("piSession: rpc process exited", "error", exitErr)
+	select {
+	case s.events <- core.Event{Type: core.EventError, Error: exitErr}:
+	case <-s.ctx.Done():
+	}
 }
 
 // ── Send ─────────────────────────────────────────────────────
@@ -358,6 +368,57 @@ func (s *piSession) Send(msg string, messageID string, images []core.ImageAttach
 		return s.sendRPC(msg, imageAtFiles, filePaths)
 	}
 	return s.sendJSON(msg, imageAtFiles, filePaths)
+}
+
+// Steer queues additional input for the currently running Pi turn. Pi's RPC
+// protocol delivers steering after the current tool calls reach a safe
+// boundary and before the next model call. One-shot JSON mode has no
+// persistent input channel, so returning an error lets the engine fall back
+// to its deferred FIFO queue.
+func (s *piSession) Steer(msg string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	s.sendWg.Add(1)
+	defer s.sendWg.Done()
+
+	if !s.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+	if !s.rpc {
+		return fmt.Errorf("pi steering requires rpc mode")
+	}
+
+	attachDir := s.attachDir
+	if safeMessageID := sanitizePiAttachmentName(messageID); safeMessageID != "" {
+		attachDir = filepath.Join(attachDir, safeMessageID)
+	}
+	cleanAttachments(attachDir)
+
+	var imageAtFiles []string
+	if len(images) > 0 {
+		imageAtFiles = append(imageAtFiles, saveImagesToDisk(attachDir, images)...)
+	}
+	var filePaths []string
+	if len(files) > 0 {
+		filePaths = append(filePaths, saveFilesToDisk(attachDir, files)...)
+	}
+
+	prompt := composeRPCPrompt(promptWithFileRefs(msg, filePaths), imageAtFiles)
+	slog.Debug("piSession: sending RPC steer", "bytes", len(msg))
+	return s.writeRPCCommand(map[string]any{
+		"type":    "steer",
+		"message": prompt,
+	})
+}
+
+// CancelTurn asks a persistent Pi RPC process to abort its current turn while
+// retaining the conversation session. JSON mode falls back to process close.
+func (s *piSession) CancelTurn() error {
+	if !s.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+	if !s.rpc {
+		return fmt.Errorf("pi turn cancellation requires rpc mode")
+	}
+	return s.writeRPCCommand(map[string]any{"type": "abort"})
 }
 
 // sendJSON spawns `pi --mode json -p <prompt>` as a one-shot process,

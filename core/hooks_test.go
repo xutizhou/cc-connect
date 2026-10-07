@@ -20,11 +20,11 @@ func boolPtr(v bool) *bool { return &v }
 func TestNewHookManager_ValidatesConfig(t *testing.T) {
 	hooks := []HookConfig{
 		{Event: "message.received", Type: "command", Command: "echo ok"},
-		{Event: "", Type: "command", Command: "echo bad"},         // missing event
-		{Event: "error", Type: "http", URL: ""},                   // missing url
-		{Event: "error", Type: "http", URL: "ftp://bad"},          // bad url scheme
-		{Event: "error", Type: "unknown", Command: "echo"},        // bad type
-		{Event: "error", Type: "command", Command: ""},            // missing command
+		{Event: "", Type: "command", Command: "echo bad"},  // missing event
+		{Event: "error", Type: "http", URL: ""},            // missing url
+		{Event: "error", Type: "http", URL: "ftp://bad"},   // bad url scheme
+		{Event: "error", Type: "unknown", Command: "echo"}, // bad type
+		{Event: "error", Type: "command", Command: ""},     // missing command
 		{Event: "message.sent", Type: "http", URL: "http://ok.com"},
 	}
 	hm := NewHookManager("test", hooks, "sh", "-c", "")
@@ -388,6 +388,7 @@ func TestEventToEnv(t *testing.T) {
 		Platform:   "telegram",
 		UserID:     "U123",
 		UserName:   "alice",
+		MessageID:  "M456",
 		Content:    "hello world",
 		Error:      "oops",
 	}
@@ -407,6 +408,7 @@ func TestEventToEnv(t *testing.T) {
 		"CC_HOOK_PLATFORM":    "telegram",
 		"CC_HOOK_USER_ID":     "U123",
 		"CC_HOOK_USER_NAME":   "alice",
+		"CC_HOOK_MESSAGE_ID":  "M456",
 		"CC_HOOK_CONTENT":     "hello world",
 		"CC_HOOK_ERROR":       "oops",
 	}

@@ -64,6 +64,10 @@ type turnStartResponse struct {
 	} `json:"turn"`
 }
 
+type turnSteerResponse struct {
+	TurnID string `json:"turnId"`
+}
+
 type turnNotification struct {
 	ThreadID string `json:"threadId"`
 	Turn     struct {
@@ -75,14 +79,48 @@ type turnNotification struct {
 	} `json:"turn"`
 }
 
+type threadTurnsListResponse struct {
+	Data       []appServerTurnSnapshot `json:"data"`
+	NextCursor string                  `json:"nextCursor"`
+}
+
+type appServerTurnSnapshot struct {
+	ID     string           `json:"id"`
+	Status string           `json:"status"`
+	Items  []map[string]any `json:"items"`
+}
+
 type itemNotification struct {
 	ThreadID string         `json:"threadId"`
 	TurnID   string         `json:"turnId"`
 	Item     map[string]any `json:"item"`
 }
 
+type agentMessageDeltaNotification struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	ItemID   string `json:"itemId"`
+	Delta    string `json:"delta"`
+}
+
+type reasoningSummaryTextDeltaNotification struct {
+	ThreadID     string `json:"threadId"`
+	TurnID       string `json:"turnId"`
+	ItemID       string `json:"itemId"`
+	SummaryIndex int64  `json:"summaryIndex"`
+	Delta        string `json:"delta"`
+}
+
 type errorNotification struct {
-	Message string `json:"message"`
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Error    struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	// Message is kept for compatibility with older app-server builds that
+	// emitted the error text at the top level.
+	Message   string `json:"message"`
+	WillRetry bool   `json:"willRetry"`
 }
 
 type appServerRateLimitsResponse struct {
@@ -176,40 +214,51 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	stateMu                 sync.Mutex
+	pendingMsgs             []string
+	currentTurn             string
+	currentTurnLocal        bool
+	localStartPending       bool
+	pendingHasFinal         bool
+	pendingHasUnknownPhase  bool
+	agentMessagePhases      map[string]string
+	reasoningSummaryIndexes map[string]int64
+	preambleSent            bool
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
 	context   *core.ContextUsage
 }
 
+var _ core.AgentSessionRecovery = (*appServerSession)(nil)
+
 const (
 	appServerRequestTimeout      = 120 * time.Second
+	appServerSteerTimeout        = 5 * time.Second
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
 )
 
 func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &appServerSession{
-		url:              url,
-		workDir:          workDir,
-		model:            model,
-		effort:           effort,
-		mode:             mode,
-		baseURL:          baseURL,
-		modelProvider:    modelProvider,
-		extraEnv:         append([]string(nil), extraEnv...),
-		codexHome:        strings.TrimSpace(codexHome),
-		promptPreamble:   buildCodexPromptPreamble(systemPrompt, appendPrompt),
-		events:           make(chan core.Event, 128),
-		ctx:              sessionCtx,
-		cancel:           cancel,
-		pending:          make(map[int64]chan rpcResponseEnvelope),
-		pendingApprovals: make(map[string]chan core.PermissionResult),
-		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
+		url:                     url,
+		workDir:                 workDir,
+		model:                   model,
+		effort:                  effort,
+		mode:                    mode,
+		baseURL:                 baseURL,
+		modelProvider:           modelProvider,
+		extraEnv:                append([]string(nil), extraEnv...),
+		codexHome:               strings.TrimSpace(codexHome),
+		promptPreamble:          buildCodexPromptPreamble(systemPrompt, appendPrompt),
+		events:                  make(chan core.Event, 128),
+		ctx:                     sessionCtx,
+		cancel:                  cancel,
+		pending:                 make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals:        make(map[string]chan core.PermissionResult),
+		agentMessagePhases:      make(map[string]string),
+		reasoningSummaryIndexes: make(map[string]int64),
+		preambleSent:            resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
 
@@ -302,10 +351,8 @@ func (s *appServerSession) initialize() error {
 			"experimentalApi": true,
 			"optOutNotificationMethods": []string{
 				"command/exec/outputDelta",
-				"item/agentMessage/delta",
 				"item/plan/delta",
 				"item/fileChange/outputDelta",
-				"item/reasoning/summaryTextDelta",
 				"item/reasoning/textDelta",
 			},
 		},
@@ -334,7 +381,7 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 		if resp.Thread.ID == "" {
 			return fmt.Errorf("codex app-server resume returned empty thread id")
 		}
-		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
+		s.applyResumedThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
 		s.threadID.Store(resp.Thread.ID)
 		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
 		return nil
@@ -391,6 +438,28 @@ func (s *appServerSession) applyThreadRuntimeState(workDir, model string, effort
 		s.model = m
 	}
 	s.effort = normalizeRuntimeReasoningEffort(stringValue(effort))
+}
+
+// applyResumedThreadRuntimeState adopts runtime values reported by an existing
+// thread only when the new session did not explicitly request an override.
+// In particular, thread/resume may report the model used by the thread's last
+// turn even when the caller supplied a new model. Overwriting the requested
+// model here would make the following turn/start silently fall back to the old
+// model and make /model appear successful without taking effect.
+func (s *appServerSession) applyResumedThreadRuntimeState(workDir, model string, effort *string) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	if dir := strings.TrimSpace(workDir); dir != "" {
+		s.workDir = dir
+	}
+	if strings.TrimSpace(s.model) == "" {
+		if m := strings.TrimSpace(model); m != "" {
+			s.model = m
+		}
+	}
+	if strings.TrimSpace(s.effort) == "" {
+		s.effort = normalizeRuntimeReasoningEffort(stringValue(effort))
+	}
 }
 
 func (s *appServerSession) refreshUsage(ctx context.Context) error {
@@ -495,19 +564,124 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 		params["approvalPolicy"] = approval
 	}
 
+	// Mark the next turn/started notification as platform-originated before
+	// issuing the request. Shared App Server notifications can arrive before
+	// the turn/start response reaches this goroutine.
+	s.stateMu.Lock()
+	s.localStartPending = true
+	s.stateMu.Unlock()
+
 	var resp turnStartResponse
 	if err := s.request("turn/start", params, &resp); err != nil {
+		s.stateMu.Lock()
+		s.localStartPending = false
+		s.stateMu.Unlock()
 		return fmt.Errorf("codex app-server turn/start: %w", err)
 	}
 	if resp.Turn.ID == "" {
+		s.stateMu.Lock()
+		s.localStartPending = false
+		s.stateMu.Unlock()
 		return fmt.Errorf("codex app-server turn/start returned empty turn id")
 	}
 
 	s.stateMu.Lock()
+	s.localStartPending = false
 	s.currentTurn = resp.Turn.ID
+	s.currentTurnLocal = true
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.pendingHasFinal = false
+	s.pendingHasUnknownPhase = false
+	clear(s.agentMessagePhases)
+	clear(s.reasoningSummaryIndexes)
 	s.stateMu.Unlock()
 
+	return nil
+}
+
+// Steer appends user input to the Codex turn currently in flight. Unlike
+// Send, turn/steer does not create a new turn or a second turn/started event,
+// so the engine's existing foreground event loop remains valid.
+func (s *appServerSession) Steer(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if !s.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+
+	if len(files) > 0 {
+		filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
+		prompt = core.AppendFileRefs(prompt, filePaths)
+	}
+
+	prompt, imagePaths, err := s.stageImages(prompt, images)
+	if err != nil {
+		return err
+	}
+
+	threadID := s.CurrentSessionID()
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if threadID == "" {
+		return fmt.Errorf("codex app-server thread id is empty")
+	}
+	if turnID == "" {
+		return fmt.Errorf("codex app-server has no active turn to steer")
+	}
+
+	input := make([]map[string]any, 0, 1+len(imagePaths))
+	input = append(input, map[string]any{
+		"type":          "text",
+		"text":          prompt,
+		"text_elements": []any{},
+	})
+	for _, path := range imagePaths {
+		input = append(input, map[string]any{
+			"type": "localImage",
+			"path": path,
+		})
+	}
+
+	params := map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input":          input,
+	}
+	if messageID != "" {
+		params["clientUserMessageId"] = messageID
+	}
+
+	var resp turnSteerResponse
+	if err := s.requestWithTimeout("turn/steer", params, &resp, appServerSteerTimeout); err != nil {
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	if resp.TurnID == "" {
+		return fmt.Errorf("codex app-server turn/steer returned empty turn id")
+	}
+	if resp.TurnID != turnID {
+		return fmt.Errorf("codex app-server turn/steer returned turn %q, expected %q", resp.TurnID, turnID)
+	}
+	return nil
+}
+
+// CancelTurn interrupts only the active Codex turn and keeps the app-server
+// thread alive so the next Feishu message can continue the same conversation.
+func (s *appServerSession) CancelTurn() error {
+	if !s.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+	threadID := s.CurrentSessionID()
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if threadID == "" || turnID == "" {
+		return fmt.Errorf("codex app-server has no active turn to interrupt")
+	}
+	if err := s.request("turn/interrupt", map[string]any{
+		"threadId": threadID,
+		"turnId":   turnID,
+	}, nil); err != nil {
+		return fmt.Errorf("codex app-server turn/interrupt: %w", err)
+	}
 	return nil
 }
 
@@ -893,6 +1067,214 @@ func (s *appServerSession) Events() <-chan core.Event {
 	return s.events
 }
 
+// RecoverMissedTurns reconciles completed App Server turns after this client
+// reconnects. thread/resume restores the live subscription, while
+// thread/turns/list covers the interval in which cc-connect was down.
+func (s *appServerSession) RecoverMissedTurns(ctx context.Context, afterTurnID string, localHistory []core.HistoryEntry) ([]core.RecoveredAgentTurn, string, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return nil, strings.TrimSpace(afterTurnID), ctx.Err()
+		default:
+		}
+	}
+
+	const (
+		pageSize = 20
+		maxPages = 10
+	)
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return nil, strings.TrimSpace(afterTurnID), fmt.Errorf("codex app-server recovery: empty thread id")
+	}
+
+	var snapshots []appServerTurnSnapshot // newest first
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		params := map[string]any{
+			"threadId":      threadID,
+			"limit":         pageSize,
+			"sortDirection": "desc",
+			"itemsView":     "summary",
+		}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var resp threadTurnsListResponse
+		if err := s.request("thread/turns/list", params, &resp); err != nil {
+			return nil, strings.TrimSpace(afterTurnID), fmt.Errorf("codex app-server recovery list turns: %w", err)
+		}
+		snapshots = append(snapshots, resp.Data...)
+		if recoveryAnchorIndex(snapshots, afterTurnID, localHistory) >= 0 || strings.TrimSpace(resp.NextCursor) == "" {
+			break
+		}
+		cursor = resp.NextCursor
+	}
+
+	// Seed an active VM turn so notifications that arrive after resume have a
+	// valid turn boundary even though turn/started happened before reconnect.
+	for _, turn := range snapshots {
+		if strings.EqualFold(strings.TrimSpace(turn.Status), "inProgress") {
+			s.seedRecoveredActiveTurn(turn)
+			break
+		}
+	}
+
+	anchor := recoveryAnchorIndex(snapshots, afterTurnID, localHistory)
+	latestCompleted := newestCompletedTurnID(snapshots)
+	if anchor < 0 {
+		// Establish a conservative baseline instead of replaying arbitrary old
+		// turns when no trustworthy cursor can be found.
+		return nil, latestCompleted, nil
+	}
+
+	newer := snapshots[:anchor]
+	recovered := make([]core.RecoveredAgentTurn, 0, len(newer))
+	for i := len(newer) - 1; i >= 0; i-- {
+		turn := newer[i]
+		if !strings.EqualFold(strings.TrimSpace(turn.Status), "completed") {
+			continue
+		}
+		assistant := recoveredTurnAssistantText(turn)
+		if strings.TrimSpace(assistant) == "" {
+			continue
+		}
+		recovered = append(recovered, core.RecoveredAgentTurn{
+			ID:               strings.TrimSpace(turn.ID),
+			UserMessage:      recoveredTurnUserText(turn),
+			AssistantMessage: assistant,
+		})
+	}
+	if len(recovered) > 0 {
+		latestCompleted = recovered[len(recovered)-1].ID
+	} else if strings.TrimSpace(afterTurnID) != "" {
+		latestCompleted = strings.TrimSpace(afterTurnID)
+	}
+	return recovered, latestCompleted, nil
+}
+
+func recoveryAnchorIndex(turns []appServerTurnSnapshot, afterTurnID string, localHistory []core.HistoryEntry) int {
+	if afterTurnID = strings.TrimSpace(afterTurnID); afterTurnID != "" {
+		for i := range turns {
+			if strings.TrimSpace(turns[i].ID) == afterTurnID {
+				return i
+			}
+		}
+	}
+	for h := len(localHistory) - 1; h >= 0; h-- {
+		if localHistory[h].Role != "assistant" || strings.TrimSpace(localHistory[h].Content) == "" {
+			continue
+		}
+		want := strings.TrimSpace(localHistory[h].Content)
+		for i := range turns {
+			if strings.TrimSpace(recoveredTurnAssistantText(turns[i])) == want {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func newestCompletedTurnID(turns []appServerTurnSnapshot) string {
+	for _, turn := range turns {
+		if strings.EqualFold(strings.TrimSpace(turn.Status), "completed") {
+			return strings.TrimSpace(turn.ID)
+		}
+	}
+	return ""
+}
+
+func recoveredTurnUserText(turn appServerTurnSnapshot) string {
+	for _, item := range turn.Items {
+		if itemType, _ := item["type"].(string); strings.EqualFold(itemType, "userMessage") {
+			if text := appServerUserMessageText(item); strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func recoveredTurnAssistantText(turn appServerTurnSnapshot) string {
+	var all []string
+	var finals []string
+	for _, item := range turn.Items {
+		itemType, _ := item["type"].(string)
+		if !strings.EqualFold(itemType, "agentMessage") {
+			continue
+		}
+		text, _ := item["text"].(string)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		all = append(all, text)
+		phase, _ := item["phase"].(string)
+		if strings.EqualFold(strings.TrimSpace(phase), "final_answer") {
+			finals = append(finals, text)
+		}
+	}
+	if len(finals) > 0 {
+		return strings.Join(finals, "")
+	}
+	return strings.Join(all, "")
+}
+
+func (s *appServerSession) seedRecoveredActiveTurn(turn appServerTurnSnapshot) {
+	turnID := strings.TrimSpace(turn.ID)
+	if turnID == "" {
+		return
+	}
+	s.stateMu.Lock()
+	if s.currentTurn != "" && s.currentTurn != turnID {
+		s.stateMu.Unlock()
+		return
+	}
+	if s.currentTurn == "" {
+		s.currentTurn = turnID
+		s.currentTurnLocal = false
+		s.pendingMsgs = s.pendingMsgs[:0]
+		s.pendingHasFinal = false
+		s.pendingHasUnknownPhase = false
+	}
+	latestCommentary := ""
+	for _, item := range turn.Items {
+		itemType, _ := item["type"].(string)
+		if !strings.EqualFold(itemType, "agentMessage") {
+			continue
+		}
+		itemID, _ := item["id"].(string)
+		phase, _ := item["phase"].(string)
+		itemID = strings.TrimSpace(itemID)
+		phase = strings.ToLower(strings.TrimSpace(phase))
+		if itemID != "" && phase != "" {
+			if s.agentMessagePhases == nil {
+				s.agentMessagePhases = make(map[string]string)
+			}
+			s.agentMessagePhases[itemID] = phase
+		}
+		text, _ := item["text"].(string)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		switch phase {
+		case "commentary":
+			// Existing commentary is progress, not part of the authoritative
+			// final answer. Publish only the newest checkpoint on reconnect.
+			latestCommentary = text
+		case "final_answer":
+			s.pendingMsgs = append(s.pendingMsgs, text)
+			s.pendingHasFinal = true
+		case "":
+			s.pendingMsgs = append(s.pendingMsgs, text)
+			s.pendingHasUnknownPhase = true
+		}
+	}
+	s.stateMu.Unlock()
+	if strings.TrimSpace(latestCommentary) != "" {
+		s.emit(core.Event{Type: core.EventThinking, Content: latestCommentary})
+	}
+}
+
 func (s *appServerSession) CurrentSessionID() string {
 	v, _ := s.threadID.Load().(string)
 	return v
@@ -970,19 +1352,40 @@ func (s *appServerSession) Close() error {
 
 func (s *appServerSession) readLoop(r io.Reader) {
 	defer s.wg.Done()
-	scanner := bufio.NewScanner(r)
-	scanBuf := make([]byte, 0, 64*1024)
-	const maxLineSize = 10 * 1024 * 1024 // 10MB
-	scanner.Buffer(scanBuf, maxLineSize)
+	// App Server responses are newline-delimited JSON. A resumed thread may
+	// include its complete history in one response, so bufio.Scanner's bounded
+	// token buffer is not appropriate here: legitimate long-lived threads can
+	// easily produce a line larger than 10 MiB. json.Decoder streams one JSON
+	// value at a time without imposing an arbitrary per-message ceiling.
+	decoder := json.NewDecoder(bufio.NewReaderSize(r, 64*1024))
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		default:
 		}
 
-		data := scanner.Bytes()
+		var data json.RawMessage
+		if err := decoder.Decode(&data); err != nil {
+			if errors.Is(err, io.EOF) {
+				s.alive.Store(false)
+				if s.ctx.Err() == nil {
+					s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
+				}
+				s.rejectPending(io.EOF)
+				s.rejectPendingApprovals(io.EOF)
+				return
+			}
+			if s.ctx.Err() == nil {
+				slog.Warn("codex app-server read failed", "error", err)
+				s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
+			}
+			s.alive.Store(false)
+			s.rejectPending(err)
+			s.rejectPendingApprovals(err)
+			return
+		}
 
 		var probe map[string]json.RawMessage
 		if err := json.Unmarshal(data, &probe); err != nil {
@@ -1017,26 +1420,6 @@ func (s *appServerSession) readLoop(r io.Reader) {
 			s.handleNotification(notif.Method, notif.Params)
 		}
 	}
-
-	err := scanner.Err()
-	if err != nil {
-		if s.ctx.Err() == nil && !errors.Is(err, io.EOF) {
-			slog.Warn("codex app-server read failed", "error", err)
-			if errors.Is(err, bufio.ErrTooLong) {
-				s.emitError(fmt.Errorf("codex app-server line exceeds max size (%d bytes): %w", maxLineSize, err))
-			} else {
-				s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
-			}
-		}
-		s.alive.Store(false)
-		s.rejectPending(err)
-		s.rejectPendingApprovals(err)
-		return
-	}
-
-	s.alive.Store(false)
-	s.rejectPending(io.EOF)
-	s.rejectPendingApprovals(io.EOF)
 }
 
 func (s *appServerSession) stderrLoop(r io.Reader) {
@@ -1103,30 +1486,54 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	switch method {
 	case "turn/started":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsThreadNotification(method, notif.ThreadID) {
 			s.stateMu.Lock()
-			s.currentTurn = notif.Turn.ID
-			s.pendingMsgs = s.pendingMsgs[:0]
+			if s.currentTurn != strings.TrimSpace(notif.Turn.ID) {
+				s.currentTurn = strings.TrimSpace(notif.Turn.ID)
+				s.currentTurnLocal = s.localStartPending
+				s.pendingMsgs = s.pendingMsgs[:0]
+				s.pendingHasFinal = false
+				s.pendingHasUnknownPhase = false
+				clear(s.agentMessagePhases)
+				clear(s.reasoningSummaryIndexes)
+			}
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
 
 	case "item/started":
 		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
+			s.ensureCurrentTurn(notif.TurnID)
 			s.handleItemStarted(notif.Item)
 		}
 
 	case "item/completed":
 		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
+			s.ensureCurrentTurn(notif.TurnID)
 			s.handleItemCompleted(notif.Item)
+		}
+
+	case "item/agentMessage/delta":
+		var notif agentMessageDeltaNotification
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
+			s.ensureCurrentTurn(notif.TurnID)
+			s.appendAgentMessageDelta(notif.ItemID, notif.Delta)
+		}
+
+	case "item/reasoning/summaryTextDelta":
+		var notif reasoningSummaryTextDeltaNotification
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
+			s.ensureCurrentTurn(notif.TurnID)
+			s.appendReasoningSummaryDelta(notif.ItemID, notif.SummaryIndex, notif.Delta)
 		}
 
 	case "turn/completed":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			if strings.EqualFold(strings.TrimSpace(notif.Turn.Status), "failed") || notif.Turn.Error != nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.Turn.ID) {
+			status := strings.ToLower(strings.TrimSpace(notif.Turn.Status))
+			if status == "failed" || notif.Turn.Error != nil {
 				errMsg := ""
 				if notif.Turn.Error != nil {
 					errMsg = strings.TrimSpace(notif.Turn.Error.Message)
@@ -1135,8 +1542,16 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 					errMsg = "turn failed (no details)"
 				}
 				s.failTurn(fmt.Errorf("%s", errMsg))
+			} else if status == "interrupted" {
+				s.failTurn(fmt.Errorf("turn interrupted"))
 			} else {
-				s.completeTurn()
+				// A successful turn is terminal only after Codex has emitted a
+				// non-empty final_answer. In particular, goal auto-continuation
+				// can make the thread transiently idle while the same turn keeps
+				// producing commentary and tool calls.
+				if !s.completeTurnWithFinal(notif.Turn.ID, true) {
+					s.failTurn(fmt.Errorf("turn completed without a final answer"))
+				}
 			}
 		}
 
@@ -1147,9 +1562,12 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 				Type string `json:"type"`
 			} `json:"status"`
 		}
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
-			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn()
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" && s.acceptsThreadNotification(method, notif.ThreadID) {
+			// thread/status is a coarse scheduling signal, not a reliable turn
+			// boundary: goal auto-continuation may briefly report idle and then
+			// resume the same turn ID. Only use it as a completion fallback when
+			// a real final_answer is already buffered.
+			s.completeTurnWithFinal("", false)
 		}
 
 	case "account/rateLimits/updated":
@@ -1160,16 +1578,75 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 
 	case "thread/tokenUsage/updated":
 		var notif appServerThreadTokenUsageNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
 			s.storeContextUsage(mapAppServerTokenUsage(notif))
 		}
 
 	case "error":
 		var notif errorNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && strings.TrimSpace(notif.Message) != "" {
-			s.emitError(fmt.Errorf("%s", notif.Message))
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.acceptsTurnNotification(method, notif.ThreadID, notif.TurnID) {
+			message := strings.TrimSpace(notif.Error.Message)
+			if message == "" {
+				message = strings.TrimSpace(notif.Message)
+			}
+			// Retriable errors are progress notifications; App Server keeps the
+			// turn alive and will later send either success or terminal failure.
+			if message != "" && !notif.WillRetry {
+				s.failTurn(fmt.Errorf("%s", message))
+			}
 		}
 	}
+}
+
+func (s *appServerSession) acceptsThreadNotification(method, threadID string) bool {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return true
+	}
+	currentThreadID := s.CurrentSessionID()
+	if currentThreadID != "" && threadID == currentThreadID {
+		return true
+	}
+	slog.Debug("codex app-server: ignoring notification for another thread",
+		"method", method, "thread_id", threadID, "current_thread_id", currentThreadID)
+	return false
+}
+
+func (s *appServerSession) acceptsTurnNotification(method, threadID, turnID string) bool {
+	if !s.acceptsThreadNotification(method, threadID) {
+		return false
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return true
+	}
+	s.stateMu.Lock()
+	currentTurn := s.currentTurn
+	s.stateMu.Unlock()
+	if currentTurn == "" || turnID == currentTurn {
+		return true
+	}
+	slog.Debug("codex app-server: ignoring notification for another turn",
+		"method", method, "turn_id", turnID, "current_turn_id", currentTurn)
+	return false
+}
+
+func (s *appServerSession) ensureCurrentTurn(turnID string) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.stateMu.Lock()
+	if s.currentTurn == "" {
+		s.currentTurn = turnID
+		s.currentTurnLocal = s.localStartPending
+		s.pendingMsgs = s.pendingMsgs[:0]
+		s.pendingHasFinal = false
+		s.pendingHasUnknownPhase = false
+		clear(s.agentMessagePhases)
+		clear(s.reasoningSummaryIndexes)
+	}
+	s.stateMu.Unlock()
 }
 
 func (s *appServerSession) handleItemStarted(item map[string]any) {
@@ -1179,11 +1656,21 @@ func (s *appServerSession) handleItemStarted(item map[string]any) {
 	}
 
 	switch itemType {
-	case "agentMessage", "reasoning", "userMessage", "plan", "hookPrompt", "contextCompaction":
+	case "agentMessage":
+		s.rememberAgentMessagePhase(item)
+		return
+	case "reasoning", "userMessage", "plan", "hookPrompt", "contextCompaction":
 		return
 	}
 
-	s.flushPendingAsThinking()
+	s.stateMu.Lock()
+	localTurn := s.currentTurnLocal
+	s.stateMu.Unlock()
+	if localTurn {
+		s.flushPendingAsThinking()
+	} else {
+		s.discardPendingMessages()
+	}
 
 	switch itemType {
 	case "commandExecution":
@@ -1219,15 +1706,62 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 	case "reasoning":
 		text := appServerReasoningText(item)
 		if text != "" {
-			s.emit(core.Event{Type: core.EventThinking, Content: text})
+			itemID, _ := item["id"].(string)
+			s.emit(core.Event{
+				Type:    core.EventThinking,
+				Content: text,
+				Done:    true,
+				Metadata: map[string]any{
+					"item_id": itemID,
+					"source":  "reasoning_summary",
+				},
+			})
 		}
 
 	case "agentMessage":
 		text, _ := item["text"].(string)
 		if strings.TrimSpace(text) != "" {
+			itemID, _ := item["id"].(string)
+			s.rememberAgentMessagePhase(item)
+			phase, _ := item["phase"].(string)
+			phase = strings.ToLower(strings.TrimSpace(phase))
 			s.stateMu.Lock()
-			s.pendingMsgs = append(s.pendingMsgs, text)
+			external := !s.currentTurnLocal
+			if !(external && phase == "commentary") {
+				s.pendingMsgs = append(s.pendingMsgs, text)
+			}
+			switch phase {
+			case "final_answer":
+				s.pendingHasFinal = true
+			case "":
+				// MessagePhase is optional in the app-server protocol. Preserve
+				// compatibility for providers that omit it, but only at the
+				// authoritative turn/completed boundary (never at transient idle).
+				s.pendingHasUnknownPhase = true
+			}
 			s.stateMu.Unlock()
+			if external && phase == "commentary" {
+				s.emit(core.Event{
+					Type:    core.EventThinking,
+					Content: text,
+					Done:    true,
+					Metadata: map[string]any{
+						"item_id": itemID,
+						"source":  "commentary",
+					},
+				})
+			}
+		}
+
+	case "userMessage":
+		text := appServerUserMessageText(item)
+		if strings.TrimSpace(text) != "" {
+			s.stateMu.Lock()
+			external := !s.currentTurnLocal
+			s.stateMu.Unlock()
+			if external {
+				s.emit(core.Event{Type: core.EventUserMessage, Content: text})
+			}
 		}
 
 	case "commandExecution":
@@ -1289,6 +1823,79 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 	}
 }
 
+func (s *appServerSession) appendAgentMessageDelta(itemID, delta string) {
+	if delta == "" {
+		return
+	}
+	itemID = strings.TrimSpace(itemID)
+	s.stateMu.Lock()
+	external := !s.currentTurnLocal
+	phase := s.agentMessagePhases[itemID]
+	s.stateMu.Unlock()
+	if !external {
+		return
+	}
+	eventType := core.EventText
+	if phase == "commentary" {
+		eventType = core.EventThinking
+	}
+	s.emit(core.Event{
+		Type:    eventType,
+		Content: delta,
+		Metadata: map[string]any{
+			"item_id": itemID,
+			"source":  phase,
+		},
+	})
+}
+
+func (s *appServerSession) appendReasoningSummaryDelta(itemID string, summaryIndex int64, delta string) {
+	if delta == "" {
+		return
+	}
+	itemID = strings.TrimSpace(itemID)
+	s.stateMu.Lock()
+	external := !s.currentTurnLocal
+	if !external {
+		s.stateMu.Unlock()
+		return
+	}
+	if s.reasoningSummaryIndexes == nil {
+		s.reasoningSummaryIndexes = make(map[string]int64)
+	}
+	previousIndex, seen := s.reasoningSummaryIndexes[itemID]
+	s.reasoningSummaryIndexes[itemID] = summaryIndex
+	s.stateMu.Unlock()
+	if seen && previousIndex != summaryIndex {
+		delta = "\n\n" + delta
+	}
+	s.emit(core.Event{
+		Type:    core.EventThinking,
+		Content: delta,
+		Metadata: map[string]any{
+			"item_id":       itemID,
+			"source":        "reasoning_summary",
+			"summary_index": summaryIndex,
+		},
+	})
+}
+
+func (s *appServerSession) rememberAgentMessagePhase(item map[string]any) {
+	itemID, _ := item["id"].(string)
+	phase, _ := item["phase"].(string)
+	itemID = strings.TrimSpace(itemID)
+	phase = strings.ToLower(strings.TrimSpace(phase))
+	if itemID == "" || phase == "" {
+		return
+	}
+	s.stateMu.Lock()
+	if s.agentMessagePhases == nil {
+		s.agentMessagePhases = make(map[string]string)
+	}
+	s.agentMessagePhases[itemID] = phase
+	s.stateMu.Unlock()
+}
+
 func appServerReasoningText(item map[string]any) string {
 	var parts []string
 	if summary, ok := item["summary"].([]any); ok {
@@ -1305,6 +1912,28 @@ func appServerReasoningText(item map[string]any) string {
 					parts = append(parts, text)
 				}
 			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func appServerUserMessageText(item map[string]any) string {
+	content, ok := item["content"].([]any)
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(content))
+	for _, entry := range content {
+		part, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		partType, _ := part["type"].(string)
+		if !strings.EqualFold(partType, "text") && !strings.EqualFold(partType, "inputText") {
+			continue
+		}
+		if text, _ := part["text"].(string); strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
 		}
 	}
 	return strings.Join(parts, "\n")
@@ -1519,16 +2148,38 @@ func rpcIDToInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-func (s *appServerSession) completeTurn() {
+func (s *appServerSession) completeTurnWithFinal(turnID string, allowUnknownPhase bool) bool {
 	s.stateMu.Lock()
-	if s.currentTurn == "" {
+	if s.currentTurn == "" || (!s.pendingHasFinal && !(allowUnknownPhase && s.pendingHasUnknownPhase)) {
 		s.stateMu.Unlock()
-		return
+		return false
 	}
+	if turnID = strings.TrimSpace(turnID); turnID != "" && turnID != s.currentTurn {
+		s.stateMu.Unlock()
+		return false
+	}
+	// app-server reports completed agent messages as whole items rather than
+	// token deltas. Deliver the buffered final answer on EventResult itself so
+	// card-style progress can atomically replace its empty body and terminal
+	// status in one update instead of opening a second preview card first.
+	completedTurnID := s.currentTurn
+	finalText := strings.Join(s.pendingMsgs, "")
 	s.currentTurn = ""
+	s.currentTurnLocal = false
+	s.pendingMsgs = s.pendingMsgs[:0]
+	s.pendingHasFinal = false
+	s.pendingHasUnknownPhase = false
+	clear(s.agentMessagePhases)
+	clear(s.reasoningSummaryIndexes)
 	s.stateMu.Unlock()
-	s.flushPendingAsText()
-	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
+	s.emit(core.Event{
+		Type:      core.EventResult,
+		Content:   finalText,
+		SessionID: s.CurrentSessionID(),
+		Done:      true,
+		Metadata:  map[string]any{"agent_turn_id": completedTurnID},
+	})
+	return true
 }
 
 func (s *appServerSession) failTurn(err error) {
@@ -1538,7 +2189,12 @@ func (s *appServerSession) failTurn(err error) {
 		return
 	}
 	s.currentTurn = ""
+	s.currentTurnLocal = false
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.pendingHasFinal = false
+	s.pendingHasUnknownPhase = false
+	clear(s.agentMessagePhases)
+	clear(s.reasoningSummaryIndexes)
 	s.stateMu.Unlock()
 	s.emitError(err)
 }
@@ -1547,6 +2203,10 @@ func (s *appServerSession) flushPendingAsThinking() {
 	s.stateMu.Lock()
 	msgs := append([]string(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
+	// Any message followed by another tool is necessarily interim, even if a
+	// provider mislabeled its phase. Do not let it authorize terminal completion.
+	s.pendingHasFinal = false
+	s.pendingHasUnknownPhase = false
 	s.stateMu.Unlock()
 
 	for _, text := range msgs {
@@ -1556,20 +2216,33 @@ func (s *appServerSession) flushPendingAsThinking() {
 	}
 }
 
-func (s *appServerSession) flushPendingAsText() {
+func (s *appServerSession) discardPendingMessages() {
 	s.stateMu.Lock()
-	msgs := append([]string(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
+	s.pendingHasFinal = false
+	s.pendingHasUnknownPhase = false
+	clear(s.agentMessagePhases)
+	clear(s.reasoningSummaryIndexes)
 	s.stateMu.Unlock()
-
-	for _, text := range msgs {
-		if strings.TrimSpace(text) != "" {
-			s.emit(core.Event{Type: core.EventText, Content: text})
-		}
-	}
 }
 
 func (s *appServerSession) emit(event core.Event) {
+	// Terminal and interactive-control events must never be silently lost when
+	// a burst of commentary/tool notifications fills the best-effort queue.
+	// Blocking here applies backpressure only to the App Server reader; it does
+	// not block the model process, and cancellation still tears it down cleanly.
+	switch event.Type {
+	case core.EventResult, core.EventError, core.EventPermissionRequest:
+		if s.ctx == nil {
+			s.events <- event
+			return
+		}
+		select {
+		case s.events <- event:
+		case <-s.ctx.Done():
+		}
+		return
+	}
 	select {
 	case s.events <- event:
 	default:

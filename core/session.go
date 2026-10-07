@@ -25,11 +25,11 @@ const ExplicitActivationTTL = 7 * 24 * time.Hour
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -46,6 +46,10 @@ type Session struct {
 	// processes an actual incoming user message. It is used by reset_on_idle_mins
 	// so that automated activity cannot prevent idle session rotation.
 	LastUserActivity time.Time `json:"last_user_activity,omitempty"`
+	// LastMirroredAgentTurnID is the newest completed backend turn whose final
+	// result has been delivered to the messaging platform. It makes restart
+	// recovery idempotent.
+	LastMirroredAgentTurnID string `json:"last_mirrored_agent_turn_id,omitempty"`
 
 	// ExplicitActivatedAt records when this session was last explicitly chosen
 	// by the user (via /switch, /new against an existing entry, or any other
@@ -203,6 +207,20 @@ func (s *Session) GetUpdatedAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.UpdatedAt
+}
+
+// SetLastMirroredAgentTurnID records the durable recovery cursor.
+func (s *Session) SetLastMirroredAgentTurnID(id string) {
+	s.mu.Lock()
+	s.LastMirroredAgentTurnID = strings.TrimSpace(id)
+	s.mu.Unlock()
+}
+
+// GetLastMirroredAgentTurnID returns the durable recovery cursor.
+func (s *Session) GetLastMirroredAgentTurnID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.LastMirroredAgentTurnID
 }
 
 // SetActiveProvider atomically records the provider name the user last
@@ -548,6 +566,20 @@ func (sm *SessionManager) AllSessions() []*Session {
 	return out
 }
 
+// ActiveSessions returns a stable snapshot of platform session-key bindings.
+// The Session pointers remain concurrency-safe through their own accessors.
+func (sm *SessionManager) ActiveSessions() map[string]*Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	out := make(map[string]*Session, len(sm.activeSession))
+	for sessionKey, id := range sm.activeSession {
+		if session := sm.sessions[id]; session != nil {
+			out[sessionKey] = session
+		}
+	}
+	return out
+}
+
 // KnownAgentSessionIDs returns the set of agent session IDs tracked by cc-connect.
 // This is used to filter agent.ListSessions() output to only sessions owned by
 // cc-connect, excluding sessions created by external CLI usage in the same work_dir.
@@ -876,7 +908,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

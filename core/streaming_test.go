@@ -131,6 +131,54 @@ func TestStreamPreview_MaxChars(t *testing.T) {
 	}
 }
 
+// Long VM turns must keep updating after filling the preview window. Keeping
+// the first MaxChars characters makes every later frame identical forever.
+func TestStreamPreview_MaxCharsKeepsLatestProgress(t *testing.T) {
+	mp := &mockUpdaterPlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 10, MinDeltaChars: 1, MaxChars: 10}
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	defer sp.freeze()
+	initial := strings.Repeat("旧", 30)
+	sp.appendText(initial)
+	latest := "新进度🙂已完成验证"
+	sp.appendText(latest)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		messages := mp.getMessages()
+		if strings.Contains(messages[len(messages)-1], latest) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	messages := mp.getMessages()
+	if got := messages[len(messages)-1]; !strings.HasSuffix(got, latest) {
+		t.Fatalf("preview stopped at its length cap instead of showing new progress: %q", got)
+	}
+	sp.freeze()
+	messages = mp.getMessages()
+	if got := messages[len(messages)-1]; !strings.HasSuffix(got, latest) {
+		t.Fatalf("freeze restored stale leading content: %q", got)
+	}
+}
+
+func TestStreamPreview_RollingWindowPreservesFullFinalAnswer(t *testing.T) {
+	mp := &mockUpdaterPlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 1, MinDeltaChars: 1, MaxChars: 10}
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	full := "保留开头的内容" + strings.Repeat("中", 30) + "最新结论🙂"
+	sp.appendText(full)
+	if got := mp.getMessages()[0]; got != "start:…"+string([]rune(full)[len([]rune(full))-10:]) {
+		t.Fatalf("initial oversized preview does not show its tail: %q", got)
+	}
+	if !sp.finish(full, "") {
+		t.Fatal("final answer was not delivered")
+	}
+	messages := mp.getMessages()
+	if got := messages[len(messages)-1]; got != "update:"+full {
+		t.Fatalf("rolling preview truncated the authoritative final answer: %q", got)
+	}
+}
+
 func TestStreamPreview_Disabled(t *testing.T) {
 	mp := &mockUpdaterPlatform{}
 	cfg := StreamPreviewCfg{Enabled: false}

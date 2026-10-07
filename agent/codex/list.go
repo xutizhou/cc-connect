@@ -13,7 +13,31 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/google/uuid"
 )
+
+// lookupCodexSession is an explicit, read-only lookup. Unlike the session
+// picker, a full ID can identify a VM thread started from another directory.
+func lookupCodexSession(sessionID, codexHome string) *core.AgentSessionInfo {
+	if len(sessionID) != 36 || uuid.Validate(sessionID) != nil {
+		return nil
+	}
+	path := findSessionFileInCodexHome(resolveCodexHomeDir(codexHome), sessionID)
+	if path == "" {
+		return nil
+	}
+	info := parseCodexSessionFile(path, "")
+	if info == nil || info.ID != sessionID {
+		return nil
+	}
+	if title := loadCodexSessionTitles(codexHome)[sessionID]; title != "" {
+		if runes := []rune(title); len(runes) > 60 {
+			title = string(runes[:60]) + "..."
+		}
+		info.Summary = title
+	}
+	return info
+}
 
 // resolveCodexHomeDir returns the effective CODEX_HOME directory.
 // Priority: explicit config value > CODEX_HOME env > ~/.codex

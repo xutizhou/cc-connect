@@ -163,6 +163,15 @@ func normalizeReasoningEffort(raw string) string {
 
 func (a *Agent) Name() string { return "codex" }
 
+// RestoreSessionsOnStartup is enabled only for the shared App Server backend.
+// Its threads can keep running from the VM while cc-connect restarts, so the
+// bridge must recreate its subscriptions without waiting for another message.
+func (a *Agent) RestoreSessionsOnStartup() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.backend == "app_server"
+}
+
 func (a *Agent) SetWorkDir(dir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -517,6 +526,21 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 	workDir := a.workDir
 	a.mu.RUnlock()
 	return listCodexSessions(workDir, codexHome)
+}
+
+func (a *Agent) LookupSession(ctx context.Context, sessionID string) (*core.AgentSessionInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	codexHome, backend := a.codexHome, a.backend
+	a.mu.RUnlock()
+	// Only the shared transport can safely attach to a live VM thread. Keep
+	// ordinary CLI sessions confined to the existing workspace picker.
+	if backend != "app_server" {
+		return nil, nil
+	}
+	return lookupCodexSession(sessionID, codexHome), nil
 }
 
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {

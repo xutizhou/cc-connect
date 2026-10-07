@@ -60,6 +60,23 @@ func TestProjectStatePath(t *testing.T) {
 	}
 }
 
+func TestProjectSessionStorePath(t *testing.T) {
+	dataDir := t.TempDir()
+
+	if got, want := projectSessionStorePath(dataDir, "demo", "/tmp/work-a", "sessions/shared.json"), filepath.Join(dataDir, "sessions", "shared.json"); got != want {
+		t.Fatalf("explicit relative path = %q, want %q", got, want)
+	}
+
+	abs := filepath.Join(t.TempDir(), "shared.json")
+	if got := projectSessionStorePath(dataDir, "demo", "/tmp/work-b", abs); got != abs {
+		t.Fatalf("explicit absolute path = %q, want %q", got, abs)
+	}
+
+	if got, want := projectSessionStorePath(dataDir, "demo", "/tmp/work-c", ""), sessionStorePath(dataDir, "demo", "/tmp/work-c"); got != want {
+		t.Fatalf("default path = %q, want %q", got, want)
+	}
+}
+
 func TestResolveResetOnIdle(t *testing.T) {
 	intPtr := func(v int) *int { return &v }
 

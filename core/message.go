@@ -443,6 +443,10 @@ type Message struct {
 	// drop late redeliveries that reuse a new message_id but an older create_time
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
+	// instantReplySent is internal engine bookkeeping. It prevents the normal
+	// event loop from sending a duplicate acknowledgement when handleMessage
+	// already acknowledged the message before a slow agent cold start.
+	instantReplySent bool
 }
 
 // EventType distinguishes different kinds of agent output.
@@ -450,6 +454,7 @@ type EventType string
 
 const (
 	EventText              EventType = "text"               // intermediate or final text
+	EventUserMessage       EventType = "user_message"       // user input observed from another shared-session client
 	EventToolUse           EventType = "tool_use"           // tool invocation info
 	EventToolResult        EventType = "tool_result"        // tool execution result
 	EventResult            EventType = "result"             // final aggregated result

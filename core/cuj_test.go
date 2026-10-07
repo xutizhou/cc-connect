@@ -130,6 +130,70 @@ type cujAgentSession struct {
 	closeCount  int
 }
 
+// cujSteeringAgent/session model a backend whose active turn stays open until
+// the test emits EventResult, while accepting native steering in the meantime.
+// This lets the CUJ assert that follow-up messages reach the running task
+// before the original request completes.
+type cujSteeringAgent struct {
+	session *cujSteeringSession
+}
+
+func (a *cujSteeringAgent) Name() string { return "cuj-steering" }
+func (a *cujSteeringAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	return a.session, nil
+}
+func (a *cujSteeringAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *cujSteeringAgent) Stop() error { return nil }
+
+type cujSteeringSession struct {
+	events      chan Event
+	sendStarted chan struct{}
+	startOnce   sync.Once
+	closed      atomic_bool
+	mu          sync.Mutex
+	sendCalls   []string
+	steerCalls  []string
+}
+
+func newCUJSteeringSession() *cujSteeringSession {
+	return &cujSteeringSession{
+		events:      make(chan Event, 8),
+		sendStarted: make(chan struct{}),
+	}
+}
+
+func (s *cujSteeringSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.sendCalls = append(s.sendCalls, prompt)
+	s.mu.Unlock()
+	s.startOnce.Do(func() { close(s.sendStarted) })
+	return nil
+}
+
+func (s *cujSteeringSession) Steer(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	s.steerCalls = append(s.steerCalls, prompt)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *cujSteeringSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *cujSteeringSession) Events() <-chan Event                                 { return s.events }
+func (s *cujSteeringSession) CurrentSessionID() string                             { return "cuj-steering-session" }
+func (s *cujSteeringSession) Alive() bool                                          { return !s.closed.Get() }
+func (s *cujSteeringSession) Close() error {
+	s.closed.Set(true)
+	return nil
+}
+
+func (s *cujSteeringSession) calls() (send, steer []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.sendCalls...), append([]string(nil), s.steerCalls...)
+}
+
 // atomic_bool is intentionally lowercase to avoid clash with stdlib atomic.Bool
 // (Go <1.19 compat is not needed but keeps lint quiet).
 type atomic_bool struct {
@@ -383,6 +447,90 @@ func TestCUJ_B3_SwitchPreservesHistoryEndToEnd(t *testing.T) {
 	}
 	if !foundUserMsg {
 		t.Fatalf("history after switch back is missing the original user message. Got: %+v", got)
+	}
+}
+
+// TestCUJ_J1_BusyMessagesSteerActiveTurn is the regression journey for the
+// Feishu "must wait for the previous task" bug. Three user actions exercise
+// the real ReceiveMessage path: start a long task, correct it, then add another
+// constraint before the first task completes.
+func TestCUJ_J1_BusyMessagesSteerActiveTurn(t *testing.T) {
+	dir := t.TempDir()
+	p := &stubPlatformEngine{n: "test"}
+	s := newCUJSteeringSession()
+	a := &cujSteeringAgent{session: s}
+	e := NewEngine("test", a, []Platform{p}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
+
+	key := "test:alice"
+	send := func(id, content string, createdAt int64) {
+		e.ReceiveMessage(p, &Message{
+			SessionKey:        key,
+			Platform:          "test",
+			MessageID:         id,
+			UserID:            "alice",
+			UserName:          "alice",
+			Content:           content,
+			ReplyCtx:          "ctx-" + id,
+			UserMessageTimeMs: createdAt,
+		})
+	}
+
+	// Action 1: start a task whose EventResult is deliberately withheld.
+	send("m1", "analyze the whole repository", 1_000)
+	select {
+	case <-s.sendStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial task did not start")
+	}
+
+	// Actions 2 and 3 must reach native steering immediately, without waiting
+	// for the original task's EventResult.
+	send("m2", "actually focus only on the failing test", 2_000)
+	send("m3", "and do not change public APIs", 3_000)
+
+	sendCalls, steerCalls := s.calls()
+	if len(sendCalls) != 1 {
+		t.Fatalf("normal Send calls = %v, want only the original request", sendCalls)
+	}
+	if len(steerCalls) != 2 || steerCalls[0] != "actually focus only on the failing test" || steerCalls[1] != "and do not change public APIs" {
+		t.Fatalf("steering calls = %v, want both corrections in order", steerCalls)
+	}
+
+	steerAcks := 0
+	for _, got := range p.getSent() {
+		if strings.Contains(got, e.i18n.T(MsgMessageSteered)) {
+			steerAcks++
+		}
+		if strings.Contains(got, e.i18n.T(MsgMessageQueued)) {
+			t.Fatalf("busy correction was deferred instead of steered: %q", got)
+		}
+	}
+	if steerAcks != 2 {
+		t.Fatalf("steering acknowledgements = %d, want 2; sent=%v", steerAcks, p.getSent())
+	}
+
+	// Let the combined active turn finish, then verify all three user inputs
+	// are visible in the persisted conversation history.
+	s.events <- Event{Type: EventResult, Content: "updated direction applied", Done: true}
+	deadline := time.Now().Add(3 * time.Second)
+	for e.sessions.GetOrCreateActive(key).Busy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if e.sessions.GetOrCreateActive(key).Busy() {
+		t.Fatal("combined steered turn did not finish")
+	}
+
+	history := e.sessions.GetOrCreateActive(key).GetHistory(0)
+	var userMessages []string
+	for _, entry := range history {
+		if entry.Role == "user" {
+			userMessages = append(userMessages, entry.Content)
+		}
+	}
+	want := []string{"analyze the whole repository", "actually focus only on the failing test", "and do not change public APIs"}
+	if fmt.Sprint(userMessages) != fmt.Sprint(want) {
+		t.Fatalf("user history = %v, want %v", userMessages, want)
 	}
 }
 

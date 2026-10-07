@@ -16,6 +16,140 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
+type streamInputWriteCloser struct {
+	bytes.Buffer
+}
+
+func (w *streamInputWriteCloser) Close() error { return nil }
+
+var _ io.WriteCloser = (*streamInputWriteCloser)(nil)
+
+func TestClaudeSession_SteerUsesStreamingUserInput(t *testing.T) {
+	stdin := &streamInputWriteCloser{}
+	cs := &claudeSession{stdin: stdin, events: make(chan core.Event, 2), ctx: context.Background()}
+	cs.alive.Store(true)
+
+	if err := cs.Steer("focus elsewhere", "msg-2", nil, nil); err != nil {
+		t.Fatalf("Steer() error = %v", err)
+	}
+	lines := nonEmptyLines(stdin.String())
+	if len(lines) != 1 {
+		t.Fatalf("lines after Steer = %q, want one interrupt request", lines)
+	}
+	var interrupt map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &interrupt); err != nil {
+		t.Fatalf("decode interrupt: %v; raw=%q", err, stdin.String())
+	}
+	request, _ := interrupt["request"].(map[string]any)
+	if interrupt["type"] != "control_request" || request["subtype"] != "interrupt" {
+		t.Fatalf("interrupt envelope = %#v", interrupt)
+	}
+
+	// Claude reports the interrupted query first. The adapter must consume
+	// that intermediate result and only then submit the replacement input.
+	cs.handleResult(map[string]any{
+		"type":    "result",
+		"subtype": "error_during_execution",
+		"result":  "interrupted",
+	})
+	lines = nonEmptyLines(stdin.String())
+	if len(lines) != 2 {
+		t.Fatalf("lines after interrupt result = %q, want interrupt + replacement input", lines)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &envelope); err != nil {
+		t.Fatalf("decode stream input: %v; raw=%q", err, stdin.String())
+	}
+	message, _ := envelope["message"].(map[string]any)
+	if envelope["type"] != "user" || message["role"] != "user" || message["content"] != "focus elsewhere" {
+		t.Fatalf("streaming user envelope = %#v", envelope)
+	}
+	select {
+	case event := <-cs.events:
+		t.Fatalf("interrupted query leaked an engine event: %#v", event)
+	default:
+	}
+
+	cs.handleResult(map[string]any{"type": "result", "subtype": "success", "result": "redirected"})
+	select {
+	case event := <-cs.events:
+		if event.Type != core.EventResult || event.Content != "redirected" {
+			t.Fatalf("final redirected result = %#v", event)
+		}
+	default:
+		t.Fatal("final redirected result was not emitted")
+	}
+}
+
+func TestClaudeSession_CancelTurnUsesInterruptControlRequest(t *testing.T) {
+	stdin := &streamInputWriteCloser{}
+	cs := &claudeSession{stdin: stdin}
+	cs.alive.Store(true)
+
+	if err := cs.CancelTurn(); err != nil {
+		t.Fatalf("CancelTurn() error = %v", err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(stdin.Bytes()), &envelope); err != nil {
+		t.Fatalf("decode control request: %v; raw=%q", err, stdin.String())
+	}
+	request, _ := envelope["request"].(map[string]any)
+	if envelope["type"] != "control_request" || request["subtype"] != "interrupt" {
+		t.Fatalf("interrupt envelope = %#v", envelope)
+	}
+}
+
+func TestClaudeSession_MultipleSteersShareOneInterrupt(t *testing.T) {
+	stdin := &streamInputWriteCloser{}
+	cs := &claudeSession{stdin: stdin, events: make(chan core.Event, 2), ctx: context.Background()}
+	cs.alive.Store(true)
+
+	if err := cs.Steer("first correction", "msg-2", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.Steer("second correction", "msg-3", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if lines := nonEmptyLines(stdin.String()); len(lines) != 1 {
+		t.Fatalf("two pending corrections wrote %d lines, want one interrupt: %q", len(lines), lines)
+	}
+
+	cs.handleResult(map[string]any{"type": "result", "subtype": "error_during_execution"})
+	lines := nonEmptyLines(stdin.String())
+	if len(lines) != 2 {
+		t.Fatalf("lines after interrupted result = %q, want interrupt + merged replacement", lines)
+	}
+	var envelope struct {
+		Message struct {
+			Content []map[string]any `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &envelope); err != nil {
+		t.Fatalf("decode merged replacement: %v", err)
+	}
+	encoded, err := json.Marshal(envelope.Message.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(encoded)
+	if !strings.Contains(got, "first correction") || !strings.Contains(got, "second correction") {
+		t.Fatalf("merged replacement lost a correction: %s", got)
+	}
+}
+
+var _ core.AgentSessionSteerer = (*claudeSession)(nil)
+var _ core.AgentSessionCanceller = (*claudeSession)(nil)
+
+func nonEmptyLines(input string) []string {
+	var lines []string
+	for _, line := range strings.Split(input, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func TestHandleResultParsesUsage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

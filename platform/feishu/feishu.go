@@ -4510,6 +4510,16 @@ type feishuPreviewHandle struct {
 	lastContent string
 }
 
+// MessageIDFromHandle implements core.MessageHandleIDProvider. It lets
+// delivery hooks address the card message that the engine updates in place.
+func (p *Platform) MessageIDFromHandle(handle any) (string, bool) {
+	h, ok := handle.(*feishuPreviewHandle)
+	if !ok || strings.TrimSpace(h.messageID) == "" {
+		return "", false
+	}
+	return h.messageID, true
+}
+
 // buildCardJSON builds a Feishu interactive card JSON string with a markdown element.
 // Uses schema 2.0 which supports code blocks, tables, and inline formatting.
 // Card font is inherently smaller than Post/Text — this is a Feishu platform limitation.
@@ -4968,15 +4978,30 @@ func appendProgressGroupedElements(elements []map[string]any, items []core.Progr
 
 func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string {
 	items := normalizeProgressItems(payload)
-	if len(items) == 0 {
+	finalAnswer := strings.TrimSpace(payload.FinalAnswer)
+	if len(items) == 0 && finalAnswer == "" {
 		return buildCardJSON(" ")
 	}
 
 	agent := progressAgentLabel(payload.Agent)
-	title, template, footer := progressStateMeta(payload.State, payload.Lang, agent)
+	title, template, lifecycleFooter := progressStateMeta(payload.State, payload.Lang, agent)
 	running := payload.State == core.ProgressCardStateRunning
+	if finalAnswer != "" {
+		// The final answer now lives in this card, so the legacy hint pointing
+		// users to a separate follow-up message would be misleading.
+		lifecycleFooter = ""
+	}
 
-	elements := make([]map[string]any, 0, len(items)+3)
+	elements := make([]map[string]any, 0, len(items)+6)
+	if finalAnswer != "" {
+		elements = append(elements, map[string]any{
+			"tag":     "markdown",
+			"content": sanitizeCardMarkdownForCard(finalAnswer),
+		})
+		if len(items) > 0 {
+			elements = append(elements, map[string]any{"tag": "hr"})
+		}
+	}
 	if payload.Truncated {
 		truncatedText := "Showing latest updates only."
 		if isZhLikeProgressLang(payload.Lang) {
@@ -4995,16 +5020,16 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	}
 
 	elements = appendProgressGroupedElements(elements, items, payload.Lang, running)
+	footer := strings.TrimSpace(payload.StatusFooter)
+	if footer == "" {
+		footer = lifecycleFooter
+	}
 	if footer != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, map[string]any{
-			"tag": "div",
-			"text": map[string]any{
-				"tag":        "plain_text",
-				"content":    footer,
-				"text_size":  "notation",
-				"text_color": "grey",
-			},
+			"tag":       "markdown",
+			"content":   sanitizeCardMarkdownForCard(footer),
+			"text_size": "notation",
 		})
 	}
 
