@@ -104,7 +104,23 @@ type piSession struct {
 // way to learn the session id is to send {"type":"get_state"} and parse the
 // matching response. By using a fixed sentinel id we can match the response
 // unambiguously even if other commands are in flight.
-const stateProbeID = "cc-connect-state-probe"
+const (
+	stateProbeID = "cc-connect-state-probe"
+
+	// Fresh Pi RPC sessions normally become ready quickly. Resuming a large
+	// session is different: Pi must load and index the JSONL history before it
+	// can answer get_state. Real sessions with hundreds of messages can take
+	// well over the legacy 30-second limit on network filesystems.
+	piRPCNewSessionReadyTimeout = 30 * time.Second
+	piRPCResumeReadyTimeout     = 2 * time.Minute
+)
+
+func piRPCReadyTimeoutFor(resumeID string) time.Duration {
+	if strings.TrimSpace(resumeID) != "" {
+		return piRPCResumeReadyTimeout
+	}
+	return piRPCNewSessionReadyTimeout
+}
 
 // sessionIDReady reports whether the session id has been observed on the
 // pi side and stored. Used by readLoopRPC to decide when it is safe to
@@ -147,13 +163,16 @@ func newPiSession(ctx context.Context, cmd string, extraArgs []string, workDir, 
 			return nil, fmt.Errorf("pi: start rpc: %w", err)
 		}
 
-		// Wait for first JSON line (indicates RPC loop is live)
+		// Wait until the startup get_state probe has returned a session id.
+		// Resuming a large history can take substantially longer than creating a
+		// fresh session, especially when the session store is on network storage.
+		readyTimeout := piRPCReadyTimeoutFor(resumeID)
 		select {
 		case <-s.rpcReady:
-		case <-time.After(30 * time.Second):
+		case <-time.After(readyTimeout):
 			s.killRPC()
 			cancel()
-			return nil, fmt.Errorf("pi: rpc process did not become ready within 30s")
+			return nil, fmt.Errorf("pi: rpc process did not become ready within %s", readyTimeout)
 		case <-ctx.Done():
 			s.killRPC()
 			return nil, fmt.Errorf("pi: context cancelled while waiting for rpc ready")
@@ -224,7 +243,7 @@ func (s *piSession) startRPC(resumeID string) error {
 	// If the probe write fails, the session is unrecoverable: without the
 	// session id we cannot resume after /stop, which is the very bug we are
 	// fixing. Bail out immediately and let the caller surface the error
-	// instead of waiting for the 30s rpcReady timeout.
+	// instead of waiting for the rpcReady timeout.
 	if err := s.writeRPCCommand(map[string]any{
 		"type": "get_state",
 		"id":   stateProbeID,

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -51,6 +52,15 @@ func TestPiSession_SteerRequiresRPCMode(t *testing.T) {
 
 var _ core.AgentSessionSteerer = (*piSession)(nil)
 var _ core.AgentSessionCanceller = (*piSession)(nil)
+
+func TestPiRPCReadyTimeoutForResumeExceedsLegacyLimit(t *testing.T) {
+	if got := piRPCReadyTimeoutFor(""); got != 30*time.Second {
+		t.Fatalf("fresh-session timeout = %s, want 30s", got)
+	}
+	if got := piRPCReadyTimeoutFor("01a0b9d7-test"); got != 2*time.Minute {
+		t.Fatalf("resume timeout = %s, want 2m", got)
+	}
+}
 
 func TestPiSession_ReadLoopRPCUnexpectedEOFEmitsTerminalError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
