@@ -107,11 +107,11 @@ type piSession struct {
 const (
 	stateProbeID = "cc-connect-state-probe"
 
-	// Fresh Pi RPC sessions normally become ready quickly. Resuming a large
-	// session is different: Pi must load and index the JSONL history before it
-	// can answer get_state. Real sessions with hundreds of messages can take
-	// well over the legacy 30-second limit on network filesystems.
-	piRPCNewSessionReadyTimeout = 30 * time.Second
+	// Both fresh and resumed Pi RPC sessions can take well over the legacy
+	// 30-second limit before answering get_state. Fresh sessions still load
+	// extensions, skills, and workspace context; on large or network-backed
+	// workdirs that cold start can be as slow as restoring a large history.
+	piRPCNewSessionReadyTimeout = 2 * time.Minute
 	piRPCResumeReadyTimeout     = 2 * time.Minute
 )
 

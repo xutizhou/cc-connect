@@ -53,9 +53,9 @@ func TestPiSession_SteerRequiresRPCMode(t *testing.T) {
 var _ core.AgentSessionSteerer = (*piSession)(nil)
 var _ core.AgentSessionCanceller = (*piSession)(nil)
 
-func TestPiRPCReadyTimeoutForResumeExceedsLegacyLimit(t *testing.T) {
-	if got := piRPCReadyTimeoutFor(""); got != 30*time.Second {
-		t.Fatalf("fresh-session timeout = %s, want 30s", got)
+func TestPiRPCReadyTimeoutCoversFreshAndResumedColdStarts(t *testing.T) {
+	if got := piRPCReadyTimeoutFor(""); got != 2*time.Minute {
+		t.Fatalf("fresh-session timeout = %s, want 2m", got)
 	}
 	if got := piRPCReadyTimeoutFor("01a0b9d7-test"); got != 2*time.Minute {
 		t.Fatalf("resume timeout = %s, want 2m", got)
